@@ -3,13 +3,28 @@
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import torch
 
 from sparse_llm.cache.expert_cache import ExpertKey
+
+
+@dataclass
+class ExpertMetadata:
+    """Legacy metadata record retained for storage backend compatibility."""
+
+    expert_id: int
+    layer_idx: int
+    size_bytes: int
+    dtype: str
+    quantized: bool
+    checksum: Optional[str] = None
 
 
 class StorageBackend(ABC):
@@ -84,7 +99,7 @@ class LocalSSDStorage(StorageBackend):
         return self.base_path / filename
 
     def _candidate_paths(self, key: ExpertKey | int) -> list[Path]:
-        """Return lookup paths, resolving a bare integer only when unique."""
+        """Return canonical paths, resolving a bare integer only when unique."""
         if isinstance(key, tuple):
             return [self._get_path(key)]
 
@@ -92,7 +107,20 @@ class LocalSSDStorage(StorageBackend):
         if legacy_path.exists():
             return [legacy_path]
 
-        matches = sorted(self.base_path.glob(f"layer_*_expert_{key:04d}.pt"))
+        matches = []
+        for candidate in self.base_path.glob("layer_*_expert_*.pt"):
+            match = re.fullmatch(r"layer_(\d+)_expert_(\d+)\.pt", candidate.name)
+            if match is None:
+                continue
+            layer = int(match.group(1))
+            expert = int(match.group(2))
+            layer = self._validate_id(layer, "layer_id")
+            expert = self._validate_id(expert, "expert_id")
+            if expert != key or candidate != self._get_path((layer, expert)):
+                continue
+            if candidate.is_file():
+                matches.append(candidate)
+        matches.sort()
         if len(matches) > 1:
             raise ValueError(f"expert {key} has ambiguous layer-aware storage entries")
         return matches or [legacy_path]
@@ -108,6 +136,7 @@ class LocalSSDStorage(StorageBackend):
     def load_expert(
         self, expert_id: ExpertKey | int, layer_id: int | None = None
     ) -> torch.Tensor:
+        """Load an expert; bare integers raise on ambiguous layer matches."""
         key, path = self._lookup_path(expert_id, layer_id)
         if not path.exists():
             if isinstance(key, tuple):
@@ -118,7 +147,12 @@ class LocalSSDStorage(StorageBackend):
             raise FileNotFoundError(f"expert {key} not found at {path}")
         try:
             return torch.load(path, map_location="cpu", weights_only=True)
-        except TypeError:
+        except TypeError as error:
+            if not re.search(
+                r"unexpected keyword argument ['\"]weights_only['\"]",
+                str(error),
+            ):
+                raise
             return torch.load(path, map_location="cpu")
 
     def save_expert(
@@ -147,9 +181,13 @@ class LocalSSDStorage(StorageBackend):
                 temporary_path.unlink(missing_ok=True)
 
     def exists(self, expert_id: ExpertKey | int, layer_id: int | None = None) -> bool:
+        """Return false for missing experts; bare integers raise if ambiguous."""
         key = self._normalize_key(expert_id, layer_id)
-        paths = [self._get_path(key)] if layer_id is not None or isinstance(expert_id, tuple) else self._candidate_paths(key)
-        return paths[0].exists()
+        if layer_id is not None or isinstance(expert_id, tuple):
+            path = self._get_path(key)
+        else:
+            path = self._candidate_paths(key)[0]
+        return path.exists()
 
 
-__all__ = ["ExpertKey", "StorageBackend", "LocalSSDStorage"]
+__all__ = ["ExpertKey", "ExpertMetadata", "StorageBackend", "LocalSSDStorage"]

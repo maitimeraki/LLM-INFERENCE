@@ -1,5 +1,5 @@
-"""Compatibility import for the canonical local SSD backend."""
+"""Compatibility imports for the canonical local SSD backend."""
 
-from sparse_llm.storage.backend import LocalSSDStorage
+from sparse_llm.storage.backend import ExpertMetadata, LocalSSDStorage
 
-__all__ = ["LocalSSDStorage"]
+__all__ = ["ExpertMetadata", "LocalSSDStorage"]
