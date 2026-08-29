@@ -1,5 +1,5 @@
-"""Public package API for SparseLLM's measured inference baseline."""
+"""Lightweight public API for SparseLLM cache primitives."""
 
-from sparse_llm.config import InferenceConfig
+from sparse_llm.cache import ExpertCache, ExpertKey
 
-__all__ = ["InferenceConfig"]
+__all__ = ["ExpertCache", "ExpertKey"]

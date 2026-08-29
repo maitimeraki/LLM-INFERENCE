@@ -1,19 +1,11 @@
-from sparse_llm import InferenceConfig, SparseInference
-import logging
-logging.basicConfig(level=logging.WARNING)
-print("\nInitializing full SparseLLM system...")
-config = InferenceConfig(
-    model_name='gpt2',
-    vram_target_gb=6,
-    enable_prediction=True,
-    enable_prefetch=True,
-    enable_quantization=True,
-    enable_production=True
-)
-inference = SparseInference(config)
-print("System initialized successfully")
-active = {k: v for k, v in inference.phase_levels.items() if v}
-print(f"Active phases: {list(active.keys())}")
-stats = inference.get_stats()
-print(f"Stats modules: {list(stats.keys())}")
-print("Production-grade SparseLLM system ready!")
+from sparse_llm import ExpertCache, ExpertKey
+
+
+def test_package_exports_lightweight_cache_api():
+    cache = ExpertCache(max_experts=1)
+
+    cache.put((0, 0), "cpu-weights")
+
+    assert ExpertKey == tuple[int, int]
+    assert cache.contains((0, 0))
+    assert cache.get((0, 0)) == "cpu-weights"

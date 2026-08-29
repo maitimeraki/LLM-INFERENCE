@@ -1,36 +1,79 @@
 import logging
-from typing import Dict, Hashable, Optional, Tuple
-from collections import OrderedDict
 import threading
 import time
+from collections import OrderedDict
+from typing import Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-ExpertKey = Tuple[int, int]
+ExpertKey = tuple[int, int]
+_CacheKey = ExpertKey | int
 
 
 class ExpertCache:
     """Bounded LRU cache for layer-aware expert weights."""
 
     def __init__(self, max_experts: int = 22):
-        if max_experts < 1:
+        if not isinstance(max_experts, int) or isinstance(max_experts, bool) or max_experts < 1:
             raise ValueError("max_experts must be positive")
         self.max_experts = max_experts
-        self.cache: OrderedDict[Hashable, object] = OrderedDict()
+        self.cache: OrderedDict[_CacheKey, object] = OrderedDict()
         self.lock = threading.Lock()
-        self.access_count: Dict[Hashable, int] = {}
-        self.last_access_time: Dict[Hashable, float] = {}
+        self.access_count: Dict[_CacheKey, int] = {}
+        self.last_access_time: Dict[_CacheKey, float] = {}
         self.hits = 0
         self.misses = 0
 
     @staticmethod
-    def _key(expert_id: int, layer_id: Optional[int] = None) -> Hashable:
-        return expert_id if layer_id is None else (layer_id, expert_id)
+    def _validate_id(value: object, name: str) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        return value
 
-    def get(self, expert_id: int, layer_id: Optional[int] = None) -> Optional[object]:
-        """Get an expert and update LRU metadata."""
-        key = self._key(expert_id, layer_id)
+    @classmethod
+    def _normalize_key(
+        cls, key_or_expert: ExpertKey | int, layer_id: Optional[int] = None
+    ) -> _CacheKey:
+        if isinstance(key_or_expert, tuple):
+            if len(key_or_expert) != 2:
+                raise ValueError("ExpertKey must be a (layer_id, expert_id) tuple")
+            tuple_layer, expert_id = key_or_expert
+            tuple_layer = cls._validate_id(tuple_layer, "layer_id")
+            expert_id = cls._validate_id(expert_id, "expert_id")
+            if layer_id is not None:
+                layer_id = cls._validate_id(layer_id, "layer_id")
+                if layer_id != tuple_layer:
+                    raise ValueError("layer_id conflicts with the ExpertKey")
+            return (tuple_layer, expert_id)
+
+        expert_id = cls._validate_id(key_or_expert, "expert_id")
+        if layer_id is None:
+            return expert_id
+        return (cls._validate_id(layer_id, "layer_id"), expert_id)
+
+    def _resolve_lookup(self, key_or_expert: ExpertKey | int, layer_id: Optional[int]) -> _CacheKey:
+        if isinstance(key_or_expert, tuple) or layer_id is not None:
+            return self._normalize_key(key_or_expert, layer_id)
+
+        expert_id = self._normalize_key(key_or_expert)
+        if expert_id in self.cache:
+            return expert_id
+
+        matches = [
+            key
+            for key in self.cache
+            if isinstance(key, tuple) and key[1] == expert_id
+        ]
+        if len(matches) > 1:
+            raise ValueError(f"expert {expert_id} has an ambiguous layer-aware cache entry")
+        if matches:
+            return matches[0]
+        return expert_id
+
+    def get(self, key_or_expert: ExpertKey | int, layer_id: Optional[int] = None) -> object | None:
+        """Get an expert, updating hit/miss counters and LRU metadata."""
         with self.lock:
+            key = self._resolve_lookup(key_or_expert, layer_id)
             if key not in self.cache:
                 self.misses += 1
                 return None
@@ -40,9 +83,14 @@ class ExpertCache:
             self.cache.move_to_end(key)
             return self.cache[key]
 
-    def put(self, expert_id: int, weights, layer_id: Optional[int] = None) -> None:
+    def put(
+        self,
+        key_or_expert: ExpertKey | int,
+        weights: object,
+        layer_id: Optional[int] = None,
+    ) -> None:
         """Add an expert, evicting the least recently used entry if full."""
-        key = self._key(expert_id, layer_id)
+        key = self._normalize_key(key_or_expert, layer_id)
         with self.lock:
             if key in self.cache:
                 self.cache[key] = weights
@@ -58,11 +106,10 @@ class ExpertCache:
             self.access_count[key] = 1
             self.last_access_time[key] = time.monotonic()
 
-    def contains(self, expert_id: int, layer_id: Optional[int] = None) -> bool:
-        """Return whether an expert is cached without affecting hit statistics."""
-        key = self._key(expert_id, layer_id)
+    def contains(self, key_or_expert: ExpertKey | int, layer_id: Optional[int] = None) -> bool:
+        """Return whether an expert is cached without changing cache statistics."""
         with self.lock:
-            return key in self.cache
+            return self._resolve_lookup(key_or_expert, layer_id) in self.cache
 
     def clear(self) -> None:
         """Clear cached weights and counters."""
@@ -84,5 +131,9 @@ class ExpertCache:
                 "misses": self.misses,
                 "hit_rate": self.hits / accesses if accesses else 0.0,
                 "avg_access_count": sum(self.access_count.values()) / len(self.cache)
-                if self.cache else 0.0,
+                if self.cache
+                else 0.0,
             }
+
+
+__all__ = ["ExpertCache", "ExpertKey"]
