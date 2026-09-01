@@ -1,144 +1,110 @@
-import logging
-import threading
-import time
-from typing import Optional, List, Dict
-import torch
-import torch.nn as nn
+"""Single public inference runtime backed by a model adapter."""
 
-from sparse_llm.scheduling.request import InferenceRequest, RequestStatus
-from sparse_llm.scheduling.queue import RequestQueue
-from sparse_llm.models.moe import SparseMoELayer
-from sparse_llm.cache.expert_cache import ExpertCache
-from sparse_llm.prefetch.pipeline import PrefetchPipeline
-from sparse_llm.storage.backend import StorageBackend
-from sparse_llm.quantization.quantizer import QuantizationManager
+from __future__ import annotations
 
-logger = logging.getLogger(__name__)
+from typing import Any
+
+from sparse_llm.models.adapters import DevicePolicy, ModelAdapter, ModelCapabilities
+from sparse_llm.models.registry import ModelRegistry, create_model_adapter, get_default_registry
 
 
 class InferenceEngine:
-    """Main orchestrator for multi-user sparse LLM inference."""
+    """Run real generation through one model-independent adapter.
 
-    def __init__(self,
-                 model: SparseMoELayer,
-                 storage: StorageBackend,
-                 device: str = "cuda",
-                 max_queue_size: int = 1000,
-                 max_cached_experts: int = 22):
-        self.model = model.to(device)
-        self.storage = storage
-        self.device = device
+    ``model`` may be a Hugging Face identifier/local directory or an already
+    constructed adapter, which keeps tests independent of model downloads.
+    """
 
-        # Request management
-        self.request_queue = RequestQueue(max_queue_size)
-        self.request_lock = threading.Lock()
+    def __init__(
+        self,
+        model: str | ModelAdapter | None = None,
+        *,
+        model_name: str | None = None,
+        device: str = "auto",
+        dtype: str | object | None = None,
+        revision: str | None = None,
+        local_files_only: bool = False,
+        trust_remote_code: bool = False,
+        device_map: Any | None = None,
+        offload_folder: str | None = None,
+        expert_cache_bytes: int | None = None,
+        registry: ModelRegistry | None = None,
+        adapter: ModelAdapter | None = None,
+    ) -> None:
+        if model is not None and model_name is not None:
+            raise ValueError("pass either model or model_name, not both")
+        if adapter is not None and (model is not None or model_name is not None):
+            raise ValueError("pass adapter or model, not both")
+        if expert_cache_bytes is not None and (
+            not isinstance(expert_cache_bytes, int)
+            or isinstance(expert_cache_bytes, bool)
+            or expert_cache_bytes < 1
+        ):
+            raise ValueError("expert_cache_bytes must be a positive integer")
+        source = model if model is not None else model_name
+        if adapter is None:
+            if isinstance(source, ModelAdapter):
+                adapter = source
+            elif isinstance(source, str):
+                policy = DevicePolicy(
+                    device=device,
+                    dtype=dtype,
+                    revision=revision,
+                    local_files_only=local_files_only,
+                    trust_remote_code=trust_remote_code,
+                    device_map=device_map,
+                    offload_folder=offload_folder,
+                    expert_cache_bytes=expert_cache_bytes,
+                )
+                adapter = (registry or get_default_registry()).create(source, policy=policy)
+            else:
+                raise ValueError("a model identifier/path or adapter is required")
+        self.adapter = adapter
+        self._last_result = None
 
-        # Expert management
-        self.expert_cache = ExpertCache(max_cached_experts)
-        self.prefetch_pipeline = PrefetchPipeline(num_streams=3)
-        self.quantization = QuantizationManager(bits=4)
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        """Return discovered capabilities, or provisional defaults before load."""
+        return self.adapter.capabilities
 
-        # Inference state
-        self.running = False
-        self.inference_thread = None
+    @property
+    def model(self) -> Any | None:
+        """Expose the loaded model for diagnostics without loading it."""
+        return getattr(self.adapter, "model", None)
 
-        logger.info(f"Initialized InferenceEngine on {device} with {max_cached_experts} expert slots")
+    def load(self) -> "InferenceEngine":
+        """Load model resources and return this engine."""
+        self.adapter.load()
+        return self
 
-    def submit_request(self, user_id: str, prompt: str, max_tokens: int = 256) -> str:
-        """Submit inference request from user."""
-        request = InferenceRequest(
-            user_id=user_id,
-            prompt=prompt,
-            max_tokens=max_tokens
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 32,
+        temperature: float = 0.0,
+    ):
+        """Run real tokenization, prefill, and autoregressive decoding."""
+        self._last_result = self.adapter.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
         )
+        return self._last_result
 
-        success = self.request_queue.enqueue(request)
-        if not success:
-            logger.warning(f"Failed to enqueue request {request.request_id} (queue full)")
-            return None
-
-        return request.request_id
-
-    def get_request_status(self, request_id: str) -> Dict:
-        """Query request status."""
-        request = self.request_queue.get_request(request_id)
-        if not request:
-            return {"status": "NOT_FOUND"}
-
+    def stats(self) -> dict[str, Any]:
+        """Return measured state without inventing cache or paging metrics."""
+        result = self._last_result
         return {
-            "status": request.status.name,
-            "result": request.result if request.status == RequestStatus.COMPLETED else None,
-            "error": request.error if request.status == RequestStatus.FAILED else None,
+            "capabilities": self.capabilities.to_dict(),
+            "loaded": self.model is not None,
+            "metrics": result.metrics.to_dict() if result is not None else None,
         }
 
-    def start(self) -> None:
-        """Start inference worker thread."""
-        if self.running:
-            logger.warning("Inference engine already running")
-            return
+    def clear_cache(self) -> None:
+        """Clear adapter-owned generation cache when an adapter provides it."""
+        clear = getattr(self.adapter, "clear_cache", None)
+        if clear is not None:
+            clear()
 
-        self.running = True
-        self.inference_thread = threading.Thread(target=self._inference_loop, daemon=False)
-        self.inference_thread.start()
-        logger.info("Started inference engine worker thread")
 
-    def stop(self) -> None:
-        """Stop inference worker thread."""
-        self.running = False
-        if self.inference_thread:
-            self.inference_thread.join(timeout=5.0)
-        logger.info("Stopped inference engine")
-
-    def _inference_loop(self) -> None:
-        """Main inference worker loop."""
-        while self.running:
-            request = self.request_queue.dequeue()
-            if not request:
-                time.sleep(0.1)
-                continue
-
-            try:
-                # Predict experts needed
-                dummy_input = torch.randn(1, self.model.input_dim, device=self.device)
-                routed_experts = self.model.get_routed_experts(dummy_input)
-
-                # Load experts to cache
-                for expert_id in routed_experts:
-                    if not self.expert_cache.contains(expert_id):
-                        self._load_expert(expert_id)
-
-                # Run inference
-                with torch.no_grad():
-                    input_tensor = torch.randn(1, 1, self.model.input_dim, device=self.device)
-                    output = self.model(input_tensor)
-
-                result = f"Generated output for '{request.prompt[:40]}...'"
-                self.request_queue.complete_request(request.request_id, result)
-                logger.info(f"Completed request {request.request_id}")
-
-            except Exception as e:
-                error_msg = str(e)
-                self.request_queue.fail_request(request.request_id, error_msg)
-                logger.error(f"Failed request {request.request_id}: {error_msg}")
-
-    def _load_expert(self, expert_id: int) -> None:
-        """Load expert from storage to cache."""
-        if self.expert_cache.contains(expert_id):
-            return
-
-        try:
-            weights = self.storage.load_expert(expert_id)
-            self.expert_cache.put(expert_id, weights)
-            logger.debug(f"Loaded expert {expert_id} to cache")
-        except Exception as e:
-            logger.error(f"Failed to load expert {expert_id}: {e}")
-            raise
-
-    def stats(self) -> Dict:
-        """Return inference engine statistics."""
-        return {
-            "queue": self.request_queue.stats(),
-            "cache": self.expert_cache.stats(),
-            "prefetch": self.prefetch_pipeline.stats(),
-            "device": self.device,
-        }
+__all__ = ["InferenceEngine", "create_model_adapter"]

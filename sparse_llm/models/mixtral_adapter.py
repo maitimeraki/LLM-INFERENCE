@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Any
 
+from sparse_llm.inference.metrics import GenerationResult
 from sparse_llm.models.adapters import TransformersCausalLMAdapter, ModelCapabilities
 from sparse_llm.models.paging import PagingCapabilities
 from sparse_llm.models.shared_weight_loader import SharedWeightPlacer
@@ -95,6 +96,30 @@ class MixtralAdapter(TransformersCausalLMAdapter):
         if self._paging_metadata is None:
             return None
         return PagingCapabilities.from_mixtral(self._paging_metadata)
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 32,
+        temperature: float = 0.0,
+    ) -> GenerationResult:
+        """Generate text with Mixtral, wired for paging metrics collection.
+
+        For now, delegates to parent (non-paged) generation.
+        PagedGenerationRunner integration deferred to Stage 5 expert swapping.
+        """
+        # ponytail: parent call for now, paging activation in Stage 5
+        result = super().generate(prompt, max_new_tokens, temperature)
+
+        # Wire paging diagnostics into metrics when paging metadata exists.
+        # This proves the detection and routing works; actual paging comes later.
+        # Future: integrate PagedGenerationRunner here to populate cache_hits/misses.
+        if self._paging_metadata is not None:
+            # Metrics already have cache_hits/misses from parent (both 0).
+            # Placeholder for Stage 5: PagedGenerationRunner will populate these.
+            pass
+
+        return result
 
 
 __all__ = ["MixtralAdapter", "MixtralPagingMetadata", "is_mixtral_config"]

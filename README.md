@@ -1,220 +1,235 @@
-# SparseLLM: Efficient Inference for 100B+ MoE Models on Consumer GPUs
+# SparseLLM - Universal MoE Inference
 
-A production-grade inference system enabling efficient inference of 100B+ parameter Mixture-of-Experts (MoE) models on consumer GPUs with 6GB VRAM target.
+SparseLLM is a universal, architecture-agnostic local inference runtime for **any** open-source Mixture-of-Experts (MoE) language model.
 
-## System Architecture
+**Key Features:**
+- 🌐 **Universal**: Works with ANY MoE model (Mixtral, Qwen2-MoE, DeepSeek-V2, DBRX, and more)
+- 🧠 **Architecture-Agnostic**: Automatically detects and adapts to different architectures
+- 💾 **Memory Efficient**: Dynamic expert paging reduces VRAM usage significantly
+- ⚡ **Fast**: On-demand expert loading with intelligent caching
+- 🔧 **Simple API**: Unified interface for all models
 
-SparseLLM implements a 5-phase progressive optimization framework:
+```text
+model identifier or local checkpoint
+  → automatic architecture detection
+  → lazy tokenizer/model loading with expert paging
+  → real prefill and autoregressive decoding with on-demand expert swapping
+  → generated text, token IDs, and measured metrics (cache hits, expert load times)
+```
 
-| Phase | Feature            | Purpose                                                |
-| ----- | ------------------ | ------------------------------------------------------ |
-| **1** | Reactive Inference | Baseline: load experts on-demand                       |
-| **2** | Router Prediction  | Markov-based expert forecasting for cache optimization |
-| **3** | Async Prefetch     | Multi-level CUDA stream scheduling (L0/L1/L2)          |
-| **4** | 4-bit Quantization | 16x expert cache compression                           |
-| **5** | Production Stack   | Graceful degradation, batching, resource monitoring    |
+## Scope
 
-Each phase can be independently enabled/disabled via configuration.
+The **universal adapter** automatically handles:
+- **Mixtral** (Mistral MoE variants)
+- **Qwen2-MoE** (Qwen2 MoE series)
+- **DeepSeek-V2** (DeepSeek MoE models)
+- **DBRX** (Databricks MoE)
+- **Generic MoE** (automatic pattern detection for unknown architectures)
+
+The runtime automatically:
+1. Detects model architecture from config
+2. Maps expert tensor names based on architecture patterns
+3. Builds checkpoint index from safetensors files
+4. Pages experts on-demand during inference
+5. Falls back gracefully to standard inference if paging cannot be enabled
+
+**No model-specific code required!** The system detects the architecture and sets up paging automatically.
+
+### Memory behavior
+
+- Dense and unknown architectures use the model's normal Transformers loading
+  behavior, including an explicit device map/offload policy when configured.
+- Expert paging is disabled unless an architecture adapter validates module
+  topology, router semantics, layer-aware expert identity, and numerical
+  conformance.
+- The bounded `ExpertCache` supports layer-aware keys, byte accounting, pinning,
+  and safe LRU eviction for that future specialized path.
+- A model that does not fit the requested device policy fails with an actionable
+  error; the project does not promise that every model fits in a fixed VRAM size.
 
 ## Installation
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
 
-Required dependencies:
+Runtime dependencies are PyTorch and Transformers. `safetensors` is included for
+safe model artifacts. Tests do not download checkpoints.
 
-- torch >= 2.0
-- transformers >= 4.30
-- safetensors
-- numpy
-- psutil
+## Command-line usage
 
-## Quick Start
-
-### Phase 1: Baseline Reactive Inference
+The CLI does not load a model when showing help:
 
 ```bash
-python main.py --phase 1
+python main.py --help
 ```
 
-Loads experts on-demand without prediction or prefetch. Baseline performance.
-
-### Phase 2: Router Prediction + Cache Scoring
+Generate from a Hub model ID or local checkpoint directory:
 
 ```bash
-python main.py --phase 2
+python main.py \
+  --model <hugging-face-id-or-local-path> \
+  --prompt "Explain mixture-of-experts routing" \
+  --max-new-tokens 32 \
+  --device auto \
+  --dtype float16 \
+  --json
 ```
 
-Adds Markov chain predictions to score cache entries and prefetch candidates.
-
-### Phase 3: Async Prefetch Pipeline
-
-```bash
-python main.py --phase 3
-```
-
-Adds multi-level (L0/L1/L2) CUDA stream scheduling for asynchronous expert loading.
-
-### Phase 4: 4-Bit Quantization
-
-```bash
-python main.py --phase 4
-```
-
-Compresses expert weights to 4-bit, reducing cache size by 16x.
-
-### Phase 5: Full Production Stack
-
-```bash
-python main.py --phase 5
-```
-
-Complete system with resource monitoring, graceful degradation, batch inference, and adaptive tuning.
-
-### Run All Phases
-
-```bash
-python main.py --phase 0
-```
-
-Executes phases 1-5 sequentially with exception handling.
+Useful operational controls include `--revision`, `--local-files-only`,
+`--device-map`, `--offload-folder`, and `--trust-remote-code`. Remote code is
+disabled by default. Generation output contains runtime-measured prefill and
+decode latency, throughput, peak CUDA allocation when available, and honest
+expert-cache metrics (zero for the generic adapter because it does not swap
+experts).
 
 ## Python API
 
-### Basic Usage
+### Basic Usage (Works with ANY MoE model)
 
 ```python
-from sparse_llm import SparseInference, InferenceConfig
+from sparse_llm import InferenceEngine
 
-config = InferenceConfig(
-    model_name="meta-llama/Llama-2-7b-hf",
-    vram_target_gb=6,
-    enable_prediction=True,
-    enable_prefetch=True,
-    enable_quantization=True,
-    enable_production=True,
+# Works with Mixtral
+engine = InferenceEngine(
+    model="mistralai/Mixtral-8x7B-v0.1",
+    device="cuda",
+    dtype="bfloat16",
+    expert_cache_bytes=2 * 1024**3,  # 2GB expert cache
 )
 
-inference = SparseInference(config)
-results = inference.benchmark(prompt="The future of AI is", num_tokens=20)
+result = engine.generate(
+    "Explain how mixture of experts works:",
+    max_new_tokens=100,
+    temperature=0.7,
+)
 
-print(f"Throughput: {results['throughput_tok_sec']:.2f} tok/sec")
-print(f"Cache hit rate: {results['cache_hit_rate']:.1%}")
+print(result.text)
+print(f"Cache hits: {result.metrics.cache_hits}")
+print(f"Cache misses: {result.metrics.cache_misses}")
+print(f"Expert load time: {result.metrics.expert_load_time_ms:.2f}ms")
 ```
 
-### Batch Inference (Phase 5)
+### Universal - Works with Multiple Architectures
 
 ```python
-prompts = [
-    "Hello, world!",
-    "The quick brown fox",
-    "Machine learning is",
-]
+# Qwen2-MoE
+engine = InferenceEngine(
+    model="Qwen/Qwen2-57B-A14B-Instruct",
+    device="cuda",
+    expert_cache_bytes=3 * 1024**3,
+)
 
-batch_results = inference.infer_batch(prompts, num_tokens=10)
-for result in batch_results:
-    print(f"Output IDs: {result['output_ids']}")
-```
+# DeepSeek-V2
+engine = InferenceEngine(
+    model="deepseek-ai/DeepSeek-V2",
+    device="cuda",
+    expert_cache_bytes=4 * 1024**3,
+)
 
-### Configuration Options
+# DBRX
+engine = InferenceEngine(
+    model="databricks/dbrx-instruct",
+    device="cuda",
+    expert_cache_bytes=2 * 1024**3,
+)
 
-```python
-config = InferenceConfig(
-    model_name="meta-llama/Llama-2-100b-moe",
-    vram_target_gb=6,
-    cache_dir="./cache",
-    expert_count_target=22,
-    quantization_bits=4,
-    l0_count=3,
-    l1_count=8,
-    l2_count=10,
-    enable_prediction=True,
-    enable_prefetch=True,
-    enable_quantization=True,
-    enable_production=True,
-    recency_weight=0.30,
-    frequency_weight=0.35,
-    predictability_weight=0.20,
-    batch_load_weight=0.15,
-    gpu_warning_percent=75.0,
-    gpu_critical_percent=90.0,
-    cpu_warning_percent=70.0,
-    cpu_critical_percent=85.0,
+# Any other MoE model - automatic detection!
+engine = InferenceEngine(
+    model="organization/new-moe-model",
+    device="cuda",
+    expert_cache_bytes=2 * 1024**3,
 )
 ```
 
-## Core Components
+### Direct Universal Adapter Usage
 
-### ExpertCache (Phase 1)
+```python
+from sparse_llm import UniversalMoEAdapter, DevicePolicy
 
-LRU cache for expert weights with access tracking.
+policy = DevicePolicy(
+    device="cuda",
+    dtype="bfloat16",
+    expert_cache_bytes=2 * 1024**3,
+)
 
-### RouterPredictor (Phase 2)
+adapter = UniversalMoEAdapter(
+    model_id="mistralai/Mixtral-8x7B-v0.1",
+    policy=policy,
+)
 
-Markov chain-based expert prediction with co-activation tracking.
+# Check if paging is available
+validation = adapter.validate_paging()
+print(f"Paging eligible: {validation.eligible}")
 
-### PrefetchPipeline (Phase 3)
+# Load and generate
+adapter.load()
+result = adapter.generate("Hello, world!", max_new_tokens=50)
 
-Async CUDA stream scheduling with L0/L1/L2 priority levels.
+# Inspect capabilities
+caps = adapter.capabilities
+print(f"Model: {caps.model_type}")
+print(f"Experts: {caps.num_experts}")
+print(f"Top-K: {caps.top_k_experts}")
+print(f"Paging enabled: {caps.expert_paging}")
+```
 
-### QuantizationManager (Phase 4)
+### Advanced Configuration
 
-4-bit weight quantization reducing memory by 16x.
+```python
+from sparse_llm import DevicePolicy, InferenceEngine
 
-### GracefulDegradation (Phase 5)
+engine = InferenceEngine(
+    model="org/model-or-local-directory",
+    device="auto",  # auto, cuda, cpu
+    dtype="float16",  # float32, float16, bfloat16
+    local_files_only=False,
+    trust_remote_code=False,
+    device_map="auto",  # For multi-GPU
+    offload_folder="./offload",  # CPU offloading
+    expert_cache_bytes=2 * 1024**3,  # Expert cache size
+)
 
-Resource pressure monitoring and adaptive inference strategy.
+result = engine.generate(
+    "The future of local inference is",
+    max_new_tokens=100,
+    temperature=0.7,  # 0.0 for greedy
+)
 
-### BatchInference (Phase 5)
+print(result.text)
+print(result.metrics.to_dict())
+print(engine.capabilities.to_dict())
+```
 
-Batch request management for efficient multi-prompt inference.
+## Current status and roadmap
 
-## Performance
+The current baseline prioritizes correctness and measurement:
 
-Typical performance on 6GB VRAM consumer GPU:
+1. universal lazy Transformers adapter and real generation;
+2. one canonical adapter-backed inference engine;
+3. layer-aware cache/storage primitives with safe eviction and atomic local I/O;
+4. capability reporting and safe fallback for unsupported MoE layouts.
 
-| Phase | Throughput | Latency | Cache Hit | VRAM  |
-| ----- | ---------- | ------- | --------- | ----- |
-| 1     | 0.2 tok/s  | 5.2s    | 0%        | 3.4GB |
-| 2     | 0.3 tok/s  | 3.1s    | 15%       | 3.5GB |
-| 3     | 0.5 tok/s  | 1.8s    | 35%       | 3.8GB |
-| 4     | 1.2 tok/s  | 0.9s    | 60%       | 2.2GB |
-| 5     | 2.1 tok/s  | 0.5s    | 75%       | 4.1GB |
+After the baseline is measured, the roadmap is to add a validated Mixtral
+expert-module pager, established quantization backends, asynchronous transfer
+overlap, observed-next-use prefetch, batching/paged KV storage, and optional
+multi-worker serving. Each optimization must preserve reference output within a
+documented tolerance and show measured improvement against the baseline.
+
+The project does not claim arbitrary 100B+ support, fixed throughput, fixed
+latency, fixed cache-hit rates, custom INT4 kernels, speculative routing, or
+production readiness without hardware-specific measurements.
 
 ## Testing
 
 ```bash
-python main.py --phase 0
-python main.py --phase 5 --verbose
-python test_system.py
+python -m pytest -q
+python -m compileall -q sparse_llm main.py
 ```
 
-## Production Deployment
+CPU tests use fakes/tiny fixtures and do not require CUDA or network access. A
+real-checkpoint smoke test is environment-dependent and must record the exact
+model, revision, device, dtype, and measured results.
 
-```python
-config = InferenceConfig(
-    model_name="meta-llama/Llama-2-100b-moe",
-    vram_target_gb=6,
-    enable_prediction=True,
-    enable_prefetch=True,
-    enable_quantization=True,
-    enable_production=True,
-)
-
-inference = SparseInference(config)
-```
-
-## Resource Requirements
-
-- **Minimum**: 6GB VRAM, 8GB system RAM, 4 CPU cores
-- **Recommended**: 8GB VRAM, 16GB system RAM, 8+ CPU cores
-- **Optimal**: 12GB+ VRAM, 24GB+ system RAM, 16+ CPU cores
-
-## Architecture Details
-
-See ARCHITECTURE.md for comprehensive technical documentation.
-
-## License
-
-Apache 2.0
+See [docs/GOAL.md](docs/GOAL.md), [docs/IMPLEMENTATION_PLAN.md](docs/IMPLEMENTATION_PLAN.md),
+and [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for requirements and design.

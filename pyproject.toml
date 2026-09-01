@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sparse-llm"
 version = "0.1.0"
-description = "Efficient inference for 100B+ MoE models on 6GB VRAM"
+description = "Model-independent local inference for compatible open-source causal language models"
 requires-python = ">=3.10"
 dependencies = [
     "torch>=2.0.0",
@@ -20,3 +20,10 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
+
+[project.scripts]
+sparse-llm = "main:main"
+
+[tool.pytest.ini_options]
+testpaths = ["sparse_llm/tests"]
+addopts = "-ra"

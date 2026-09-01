@@ -1,134 +1,125 @@
 #!/usr/bin/env python3
-"""SparseLLM v2: Multi-user sparse MoE inference system."""
+"""Command-line entry point for measured local causal-LM generation."""
 
-import logging
-import time
-import torch
+from __future__ import annotations
 
-from sparse_llm.models import SparseMoELayer
-from sparse_llm.storage import LocalSSDStorage
-from sparse_llm.inference import InferenceEngine
+import argparse
+import json
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+from sparse_llm import DevicePolicy, InferenceEngine
 
 
-def demo_basic_inference():
-    """Demo: Basic multi-user inference with sparse MoE."""
-    logger.info("=" * 70)
-    logger.info("DEMO: Multi-User Sparse MoE Inference")
-    logger.info("=" * 70)
-
-    model = SparseMoELayer(
-        input_dim=768,
-        num_experts=22,
-        expert_dim=3072,
-        top_k=4
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate text with any Transformers-compatible causal language model."
     )
-    logger.info(f"Initialized SparseMoELayer: {model.num_experts} experts, top-k={model.top_k}")
+    parser.add_argument("--model", required=True, help="Hugging Face model ID or local checkpoint directory")
+    parser.add_argument("--prompt", required=True, help="Prompt to tokenize and continue")
+    parser.add_argument("--max-new-tokens", type=int, default=32, help="Maximum number of generated tokens")
+    parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature; zero uses greedy decoding")
+    parser.add_argument("--device", default="auto", help="Execution device, such as auto, cpu, or cuda")
+    parser.add_argument(
+        "--dtype",
+        default=None,
+        choices=("float32", "float16", "bfloat16", "fp32", "fp16", "bf16"),
+        help="Optional model dtype",
+    )
+    parser.add_argument("--revision", default=None, help="Optional immutable model revision or commit")
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Do not contact the model hub; require local cached/model files",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Allow custom model code (disabled by default)",
+    )
+    parser.add_argument(
+        "--device-map",
+        default=None,
+        help="Optional Transformers device map, for example auto",
+    )
+    parser.add_argument(
+        "--offload-folder",
+        default=None,
+        help="Optional folder used by a Transformers device-map offload policy",
+    )
+    parser.add_argument(
+        "--cache-bytes",
+        type=int,
+        default=None,
+        help="Reserved expert-paging budget in bytes; generic adapters do not page experts",
+    )
+    parser.add_argument("--json", action="store_true", help="Print a JSON result")
+    return parser
 
-    storage = LocalSSDStorage(base_path="./expert_storage")
-    logger.info("Initialized LocalSSDStorage")
 
+def run(args: argparse.Namespace) -> int:
+    if args.max_new_tokens < 0:
+        raise ValueError("--max-new-tokens must be non-negative")
+    if args.temperature < 0:
+        raise ValueError("--temperature must be non-negative")
+    if args.cache_bytes is not None and args.cache_bytes < 1:
+        raise ValueError("--cache-bytes must be positive")
+
+    policy = DevicePolicy(
+        device=args.device,
+        dtype=args.dtype,
+        revision=args.revision,
+        local_files_only=args.local_files_only,
+        trust_remote_code=args.trust_remote_code,
+        device_map=args.device_map,
+        offload_folder=args.offload_folder,
+        expert_cache_bytes=args.cache_bytes,
+    )
     engine = InferenceEngine(
-        model=model,
-        storage=storage,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        max_queue_size=1000,
-        max_cached_experts=22
+        model=args.model,
+        device=policy.device,
+        dtype=policy.dtype,
+        revision=policy.revision,
+        local_files_only=policy.local_files_only,
+        trust_remote_code=policy.trust_remote_code,
+        device_map=policy.device_map,
+        offload_folder=policy.offload_folder,
+        expert_cache_bytes=policy.expert_cache_bytes,
     )
-    logger.info(f"Initialized InferenceEngine on {engine.device}")
+    result = engine.generate(args.prompt, args.max_new_tokens, args.temperature)
+    payload = {
+        "text": result.text,
+        "token_ids": result.token_ids,
+        "metrics": result.metrics.to_dict(),
+        "capabilities": engine.capabilities.to_dict(),
+    }
 
-    engine.start()
-    logger.info("Started inference engine worker thread")
+    # Add paging diagnostics when expert paging is enabled or available.
+    if engine.capabilities.expert_paging:
+        payload["paging_diagnostics"] = {
+            "enabled": True,
+            "cache_hits": result.metrics.cache_hits,
+            "cache_misses": result.metrics.cache_misses,
+            "expert_load_time_ms": result.metrics.expert_load_time_ms,
+        }
 
-    user_prompts = [
-        ("user_1", "The quick brown fox jumps over the lazy dog", 50),
-        ("user_2", "SparseLLM enables efficient inference for MoE models", 50),
-        ("user_3", "Loading only active experts reduces memory footprint", 50),
-    ]
-
-    request_ids = []
-    for user_id, prompt, max_tokens in user_prompts:
-        req_id = engine.submit_request(user_id, prompt, max_tokens)
-        request_ids.append(req_id)
-        logger.info(f"Submitted request {req_id} from {user_id}")
-
-    logger.info("\nMonitoring request status...")
-    for _ in range(5):
-        time.sleep(0.5)
-        stats = engine.stats()
-        logger.info(f"Queue: {stats['queue']}")
-        logger.info(f"Cache: {stats['cache']}")
-
-    logger.info("\nFinal request status:")
-    for req_id in request_ids:
-        status = engine.get_request_status(req_id)
-        logger.info(f"Request {req_id}: {status}")
-
-    engine.stop()
-    logger.info("Stopped inference engine")
-
-    return True
+    if args.cache_bytes is not None:
+        payload["configured_expert_cache_bytes"] = args.cache_bytes
+    if args.json:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(result.text)
+        print(json.dumps({"metrics": payload["metrics"], "capabilities": payload["capabilities"]}, indent=2, sort_keys=True))
+    return 0
 
 
-def demo_cache_efficiency():
-    """Demo: Expert cache with LRU + scoring."""
-    logger.info("=" * 70)
-    logger.info("DEMO: Expert Cache Efficiency")
-    logger.info("=" * 70)
-
-    model = SparseMoELayer(
-        input_dim=768,
-        num_experts=22,
-        expert_dim=3072,
-        top_k=4
-    )
-
-    storage = LocalSSDStorage(base_path="./expert_storage")
-    engine = InferenceEngine(
-        model=model,
-        storage=storage,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-        max_cached_experts=8
-    )
-
-    engine.start()
-
-    logger.info("Submitting batch requests to trigger cache behavior...")
-    for i in range(5):
-        req_id = engine.submit_request(f"user_{i}", f"Prompt {i}", 20)
-        logger.info(f"Submitted request {req_id}")
-        time.sleep(0.1)
-
-    time.sleep(1.0)
-
-    stats = engine.stats()
-    logger.info(f"Cache stats: {stats['cache']}")
-    logger.info(f"Prefetch stats: {stats['prefetch']}")
-
-    engine.stop()
-    return True
-
-
-def main():
-    """Run all demos."""
-    logger.info("SparseLLM v2: Multi-User Sparse MoE Inference System\n")
-
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
     try:
-        demo_basic_inference()
-        print()
-        demo_cache_efficiency()
-        print()
-        logger.info("[OK] All demos completed successfully!")
-        return 0
-    except Exception as e:
-        logger.error(f"Demo failed: {e}", exc_info=True)
-        return 1
+        return run(args)
+    except (RuntimeError, TypeError, ValueError) as error:
+        parser.error(str(error))
+        return 2
 
 
 if __name__ == "__main__":
-    exit(main())
+    raise SystemExit(main())
