@@ -56,6 +56,15 @@ pip install -e ".[dev]"
 Runtime dependencies are PyTorch and Transformers. `safetensors` is included for
 safe model artifacts. Tests do not download checkpoints.
 
+## Quick Start: Mixtral
+
+```bash
+python main.py --model mistralai/Mixtral-8x7B-v0.1 --prompt "Hello" --max-new-tokens 32 --json
+```
+
+The registry automatically selects the Mixtral adapter if the model's config is recognized.
+Paging infrastructure is wired; actual expert swaps enabled in Stage 5.
+
 ## Command-line usage
 
 The CLI does not load a model when showing help:
