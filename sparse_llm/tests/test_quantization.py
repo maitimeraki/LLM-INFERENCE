@@ -3,7 +3,9 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 
+from sparse_llm.inference.quantized_loader import QuantizedExpertLoader
 from sparse_llm.models.quantization import (
     QuantizationPolicy,
     detect_quantization,
@@ -376,3 +378,155 @@ def test_quantization_policy_is_hashable():
 
     policy_dict = {policy1: "int8_32"}
     assert policy_dict[policy2] == "int8_32"
+
+
+class TestQuantizedExpertLoader:
+    """QuantizedExpertLoader tests."""
+
+    def test_unquantized_loader_passes_through(self):
+        """Unquantized loader returns tensors unchanged."""
+        loader = QuantizedExpertLoader(policy=None, device="cpu")
+        tensors = {"w1": torch.randn(256, 256), "w2": torch.randn(256, 256)}
+        result = loader.load_expert((0, 0), tensors)
+        assert result is tensors  # Same object returned
+
+    def test_unquantized_policy_passes_through(self):
+        """Unquantized policy returns tensors unchanged."""
+        policy = QuantizationPolicy()  # Default: format=None
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+        tensors = {"w1": torch.randn(256, 256)}
+        result = loader.load_expert((0, 0), tensors)
+        assert result is tensors
+
+    def test_quantized_loader_requires_state_dict(self):
+        """Quantized loader raises if state_dict is missing."""
+        policy = QuantizationPolicy(format="int8", group_size=32)
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+        tensors = {"w1": torch.randn(256, 256)}
+        with pytest.raises(ValueError, match="state_dict required"):
+            loader.load_expert((0, 0), tensors, state_dict=None)
+
+    def test_int8_dequantization_basic(self):
+        """INT8 dequantization produces fp32 output."""
+        policy = QuantizationPolicy(format="int8", group_size=32, scale_type="absmax")
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+
+        # Create quantized int8 tensor and scale
+        q_tensor = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int8)
+        scale = torch.tensor([0.1], dtype=torch.float32)
+        zero_point = torch.tensor([0], dtype=torch.int8)
+
+        state_dict = {
+            "model.layers.0.experts.0.w_q_scale": scale,
+            "model.layers.0.experts.0.w_q_zero": zero_point,
+        }
+        tensors = {"w_q": q_tensor}
+
+        result = loader.load_expert((0, 0), tensors, state_dict)
+
+        # Result should be float32
+        assert result["w_q"].dtype == torch.float32
+        # Values should be dequantized: (q - zero_point) * scale
+        expected = q_tensor.float() * scale
+        torch.testing.assert_close(result["w_q"], expected)
+
+    def test_fp8_dequantization_basic(self):
+        """FP8 dequantization converts to fp32 and applies scale."""
+        policy = QuantizationPolicy(format="fp8", group_size=-1, scale_type="absmax")
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+
+        # Create simulated FP8 tensor (convert from float32)
+        fp32_tensor = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
+        # Convert to a lower precision (simulate FP8 by clipping to 8-bit range)
+        q_tensor = fp32_tensor.to(torch.bfloat16)  # Simulate quantized
+
+        scale = torch.tensor([0.5], dtype=torch.float32)
+
+        state_dict = {
+            "model.layers.1.experts.2.w_q_scale": scale,
+            "model.layers.1.experts.2.w_q_zero": torch.tensor([0.0]),
+        }
+        tensors = {"w_q": q_tensor}
+
+        result = loader.load_expert((1, 2), tensors, state_dict)
+
+        # Result should be float32
+        assert result["w_q"].dtype == torch.float32
+        # Should have applied scale
+        assert result["w_q"].shape == q_tensor.shape
+
+    def test_dequantization_time_tracking(self):
+        """Dequantization time is tracked and can be reset."""
+        policy = QuantizationPolicy(format="int8")
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+
+        # Initially zero
+        assert loader.dequantization_time_ms() == 0.0
+
+        # After successful dequantization
+        q_tensor = torch.tensor([[1, 2]], dtype=torch.int8)
+        scale = torch.tensor([0.1])
+        state_dict = {
+            "model.layers.0.experts.0.w_q_scale": scale,
+            "model.layers.0.experts.0.w_q_zero": torch.tensor([0]),
+        }
+        loader.load_expert((0, 0), {"w": q_tensor}, state_dict)
+        assert loader.dequantization_time_ms() > 0.0
+
+        # Reset works
+        time_before = loader.dequantization_time_ms()
+        loader.reset_time()
+        assert loader.dequantization_time_ms() == 0.0
+
+    def test_passthrough_when_scale_missing(self):
+        """Loader passes through when scale tensor not found."""
+        policy = QuantizationPolicy(format="int8")
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+
+        tensors = {"w": torch.randn(2, 2)}
+        state_dict = {}  # No scales
+
+        result = loader.load_expert((0, 0), tensors, state_dict)
+        assert result is tensors  # Unchanged
+
+    def test_mixed_quantized_unquantized_tensors(self):
+        """Loader handles mix of quantized and unquantized tensors."""
+        policy = QuantizationPolicy(format="int8")
+        loader = QuantizedExpertLoader(policy=policy, device="cpu")
+
+        q_tensor = torch.tensor([[1, 2]], dtype=torch.int8)
+        fp32_tensor = torch.randn(2, 2, dtype=torch.float32)
+
+        scale = torch.tensor([0.1])
+        state_dict = {
+            "model.layers.0.experts.0.w_q_scale": scale,
+            "model.layers.0.experts.0.w_q_zero": torch.tensor([0]),
+        }
+        tensors = {"w_q": q_tensor, "w_fp32": fp32_tensor}
+
+        result = loader.load_expert((0, 0), tensors, state_dict)
+
+        # Quantized tensor dequantized to float32
+        assert result["w_q"].dtype == torch.float32
+        # Unquantized tensor passed through
+        assert result["w_fp32"].dtype == torch.float32
+
+    def test_device_placement(self):
+        """Dequantized tensors are placed on target device."""
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA not available")
+
+        policy = QuantizationPolicy(format="int8")
+        loader = QuantizedExpertLoader(policy=policy, device="cuda")
+
+        q_tensor = torch.tensor([[1, 2]], dtype=torch.int8)
+        scale = torch.tensor([0.1])
+        state_dict = {
+            "model.layers.0.experts.0.w_q_scale": scale,
+            "model.layers.0.experts.0.w_q_zero": torch.tensor([0]),
+        }
+        tensors = {"w": q_tensor}
+
+        result = loader.load_expert((0, 0), tensors, state_dict)
+        assert result["w"].device.type == "cuda"
+

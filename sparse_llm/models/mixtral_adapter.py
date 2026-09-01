@@ -1,4 +1,4 @@
-"""Mixtral-8x7B adapter with MoE paging metadata extraction."""
+"""Mixtral-8x7B adapter with MoE paging and quantization support."""
 
 from __future__ import annotations
 
@@ -6,8 +6,10 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 from sparse_llm.inference.metrics import GenerationResult
+from sparse_llm.inference.quantized_loader import QuantizedExpertLoader
 from sparse_llm.models.adapters import TransformersCausalLMAdapter, ModelCapabilities
 from sparse_llm.models.paging import PagingCapabilities
+from sparse_llm.models.quantization import QuantizationPolicy, detect_quantization
 from sparse_llm.models.shared_weight_loader import SharedWeightPlacer
 
 
@@ -45,13 +47,16 @@ class MixtralPagingMetadata:
 
 
 class MixtralAdapter(TransformersCausalLMAdapter):
-    """Mixtral-8x7B adapter with paging-aware topology extraction."""
+    """Mixtral-8x7B adapter with paging and quantization support."""
 
     def __init__(self, model_id: str, **kwargs: Any) -> None:
         self._paging_metadata: MixtralPagingMetadata | None = None
+        self._quant_policy: QuantizationPolicy | None = None
+        self._quant_loader: QuantizedExpertLoader | None = None
         super().__init__(model_id, **kwargs)
         if self.config is not None:
             self._extract_paging_metadata()
+            self._detect_quantization()
 
     def _extract_paging_metadata(self) -> None:
         """Extract Mixtral-specific paging metadata from config."""
@@ -67,6 +72,19 @@ class MixtralAdapter(TransformersCausalLMAdapter):
                 num_experts_per_tok=num_experts_per_tok,
             )
 
+    def _detect_quantization(self) -> None:
+        """Detect quantization policy from model config."""
+        if self.config is None:
+            return
+        quant_config = getattr(self.config, "quantization_config", None)
+        self._quant_policy = detect_quantization(quant_config)
+        if self._quant_policy and self._quant_policy.is_quantized():
+            # Initialize quantized loader with detected policy
+            device = getattr(self, "device", "cpu")
+            self._quant_loader = QuantizedExpertLoader(
+                policy=self._quant_policy, device=device
+            )
+
     def _discover_capabilities(self, config: Any | None, model: Any | None) -> ModelCapabilities:
         """Override to enable expert_paging for Mixtral models."""
         capabilities = super()._discover_capabilities(config, model)
@@ -80,9 +98,16 @@ class MixtralAdapter(TransformersCausalLMAdapter):
         return capabilities
 
     def load(self) -> "MixtralAdapter":
-        """Load model and extract paging metadata, classify weights."""
+        """Load model and extract paging/quantization metadata, classify weights."""
         super().load()
         self._extract_paging_metadata()
+        self._detect_quantization()
+        # Re-initialize quantized loader with correct device after model load
+        if self._quant_policy and self._quant_policy.is_quantized():
+            device = self.model.device if hasattr(self.model, "device") else "cpu"
+            self._quant_loader = QuantizedExpertLoader(
+                policy=self._quant_policy, device=device
+            )
         # Classify weights for memory-safe loading (diagnostic only, no device placement)
         if self.config is not None:
             placer = SharedWeightPlacer(self.config)
@@ -96,6 +121,35 @@ class MixtralAdapter(TransformersCausalLMAdapter):
         if self._paging_metadata is None:
             return None
         return PagingCapabilities.from_mixtral(self._paging_metadata)
+
+    @property
+    def quantization_policy(self) -> QuantizationPolicy | None:
+        """Return detected quantization policy, if any."""
+        return self._quant_policy
+
+    def load_expert_tensors(
+        self,
+        key: tuple[int, int],
+        tensors: dict[str, Any],
+        state_dict: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Load and dequantize expert tensors using quantization policy.
+
+        If quantization is active, dequantizes tensors in-place.
+        Otherwise returns tensors unchanged (backward-compatible).
+
+        Args:
+            key: (layer_index, expert_index) tuple.
+            tensors: Expert weight tensors from checkpoint.
+            state_dict: Full model state dict for scale/zero-point extraction.
+
+        Returns:
+            Dequantized expert tensors, or original tensors if unquantized.
+        """
+        if self._quant_loader is None:
+            # No quantization; return original
+            return tensors
+        return self._quant_loader.load_expert(key, tensors, state_dict)
 
     def generate(
         self,
