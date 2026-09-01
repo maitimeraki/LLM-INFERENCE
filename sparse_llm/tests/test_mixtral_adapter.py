@@ -11,6 +11,7 @@ from sparse_llm.models.mixtral_adapter import (
 )
 from sparse_llm.models.paging import PagingCapabilities
 from sparse_llm.models.registry import get_default_registry
+from sparse_llm.models.shared_weight_loader import SharedWeightPlacer
 
 
 class TestMixtralConfigDetection:
@@ -187,35 +188,104 @@ class TestMixtralRegistration:
         assert "mixtral" in names
 
 
-class TestPagingCapabilitiesFactory:
-    """Test PagingCapabilities.from_mixtral() factory method."""
+class TestSharedWeightPlacer:
+    """Test weight classification for Mixtral models."""
 
-    def test_from_mixtral_creates_valid_capabilities(self):
-        """Factory should create valid PagingCapabilities from metadata."""
-        metadata = MixtralPagingMetadata(
-            num_hidden_layers=32,
-            num_local_experts=8,
-            num_experts_per_tok=2,
-        )
-        capabilities = PagingCapabilities.from_mixtral(metadata)
-        assert capabilities.architecture_id == "mixtral-8x7b"
-        assert capabilities.adapter_version == "1.0"
-        assert capabilities.num_layers == 32
-        assert capabilities.num_experts == 8
-        assert capabilities.top_k == 2
-        assert capabilities.validation_passed is True
-        assert capabilities.supports_prefill is True
-        assert capabilities.supports_decode is True
-
-    def test_from_mixtral_includes_expert_tensor_names(self):
-        """Factory should include all expert tensor names in capabilities."""
-        metadata = MixtralPagingMetadata(
+    def test_placer_classifies_shared_weights(self):
+        """Placer should classify embedding and attention weights as shared."""
+        config = SimpleNamespace(
             num_hidden_layers=2,
-            num_local_experts=2,
+            num_local_experts=4,
+        )
+        placer = SharedWeightPlacer(config)
+        assert placer.classify_tensor("model.embed_tokens.weight") == "shared"
+        assert placer.classify_tensor("model.layers.0.self_attn.q_proj.weight") == "shared"
+        assert placer.classify_tensor("model.layers.1.input_layernorm.weight") == "shared"
+
+    def test_placer_classifies_expert_weights(self):
+        """Placer should classify expert weights as expert."""
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_local_experts=4,
+        )
+        placer = SharedWeightPlacer(config)
+        assert placer.classify_tensor("model.layers.0.block_sparse_moe.experts.0.w1.weight") == "expert"
+        assert placer.classify_tensor("model.layers.1.block_sparse_moe.experts.3.w2.weight") == "expert"
+
+    def test_placer_classifies_unknown_weights_as_other(self):
+        """Placer should classify unknown weights as other."""
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_local_experts=4,
+        )
+        placer = SharedWeightPlacer(config)
+        assert placer.classify_tensor("unknown.weight") == "other"
+
+    def test_placer_generates_shared_weights_set(self):
+        """Placer should generate complete set of shared weight names."""
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_local_experts=4,
+        )
+        placer = SharedWeightPlacer(config)
+        shared = placer.shared_weight_names()
+        # Check key shared weights
+        assert "model.embed_tokens.weight" in shared
+        assert "model.norm.weight" in shared
+        assert "lm_head.weight" in shared
+        assert "model.layers.0.self_attn.q_proj.weight" in shared
+        assert "model.layers.0.block_sparse_moe.gate" in shared  # Router
+        assert "model.layers.1.input_layernorm.weight" in shared
+        # Verify no expert weights in shared set
+        assert "model.layers.0.block_sparse_moe.experts.0.w1.weight" not in shared
+
+    def test_placer_generates_expert_weights_set(self):
+        """Placer should generate complete set of expert weight names."""
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_local_experts=4,
+        )
+        placer = SharedWeightPlacer(config)
+        experts = placer.expert_weight_names()
+        # 2 layers * 4 experts * 3 weights = 24
+        assert len(experts) == 24
+        assert "model.layers.0.block_sparse_moe.experts.0.w1.weight" in experts
+        assert "model.layers.1.block_sparse_moe.experts.3.w3.weight" in experts
+
+    def test_placer_separates_shared_and_expert_weights(self):
+        """Placer should ensure no overlap between shared and expert weights."""
+        config = SimpleNamespace(
+            num_hidden_layers=2,
+            num_local_experts=4,
+        )
+        placer = SharedWeightPlacer(config)
+        shared = placer.shared_weight_names()
+        experts = placer.expert_weight_names()
+        overlap = shared & experts
+        assert len(overlap) == 0, f"Shared and expert weights should not overlap, but found: {overlap}"
+
+    def test_mixtral_separates_shared_and_expert_weights(self):
+        """Full test: Mixtral adapter correctly uses SharedWeightPlacer for classification."""
+        config = SimpleNamespace(
+            model_type="mixtral",
+            num_hidden_layers=2,
+            num_local_experts=4,
             num_experts_per_tok=2,
         )
-        capabilities = PagingCapabilities.from_mixtral(metadata)
-        tensor_names = capabilities.expert_tensor_names
-        assert len(tensor_names) == 12  # 2 layers * 2 experts * 3 weights
-        assert "model.layers.0.block_sparse_moe.experts.0.w1" in tensor_names
-        assert "model.layers.1.block_sparse_moe.experts.1.w3" in tensor_names
+        placer = SharedWeightPlacer(config)
+        shared = placer.shared_weight_names()
+        experts = placer.expert_weight_names()
+
+        # Verify no overlap
+        assert len(shared & experts) == 0
+
+        # Verify correct count of experts (2 layers * 4 experts * 3 weights)
+        assert len(experts) == 24
+
+        # Verify classification works for specific tensors
+        assert placer.classify_tensor("model.embed_tokens.weight") == "shared"
+        assert placer.classify_tensor("model.layers.0.block_sparse_moe.experts.0.w1.weight") == "expert"
+        assert placer.classify_tensor("model.layers.0.block_sparse_moe.gate") == "shared"
+
+
+

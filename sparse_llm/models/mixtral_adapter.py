@@ -7,6 +7,7 @@ from typing import Any
 
 from sparse_llm.models.adapters import TransformersCausalLMAdapter, ModelCapabilities
 from sparse_llm.models.paging import PagingCapabilities
+from sparse_llm.models.shared_weight_loader import SharedWeightPlacer
 
 
 def is_mixtral_config(config: Any) -> bool:
@@ -78,9 +79,14 @@ class MixtralAdapter(TransformersCausalLMAdapter):
         return capabilities
 
     def load(self) -> "MixtralAdapter":
-        """Load model and extract paging metadata."""
+        """Load model and extract paging metadata, classify weights."""
         super().load()
         self._extract_paging_metadata()
+        # Classify weights for memory-safe loading (diagnostic only, no device placement)
+        if self.config is not None:
+            placer = SharedWeightPlacer(self.config)
+            # Classification is available via placer.classify_tensor(name)
+            # Future integration: use for device placement decisions
         return self
 
     @property
