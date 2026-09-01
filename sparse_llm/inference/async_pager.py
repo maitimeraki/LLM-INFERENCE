@@ -33,14 +33,24 @@ class AsyncExpertPager:
         self,
         sync_pager: ExpertPager,
         config: BackpressureConfig | None = None,
+        num_experts: int = 256,
     ) -> None:
         self.sync_pager = sync_pager
         self.config = config or BackpressureConfig()
+        self.num_experts = num_experts
 
         # Async task management
         # ponytail: global semaphore, per-expert locks if concurrency limits matter
         self._prefetch_semaphore = asyncio.Semaphore(self.config.max_outstanding)
         self._pending: dict[ExpertKey, asyncio.Task[LoadedExpert | None]] = {}
+
+        # Router predictor for prefetch prediction
+        self.predictor = RouterPredictor(num_experts=num_experts, num_top_predictions=min(8, num_experts))
+
+        # Statistics
+        self._prefetch_hits = 0
+        self._prefetch_misses = 0
+        self._prefetch_scheduled = 0
 
     @contextmanager
     def sync_lease(self, key: ExpertKey) -> Iterator[LoadedExpert]:
@@ -119,13 +129,82 @@ class AsyncExpertPager:
         else:
             yield loaded
 
+    def schedule_prefetch(self, predicted_experts: list[int], layer_index: int) -> None:
+        """Schedule predicted experts for async prefetch.
+
+        Args:
+            predicted_experts: Expert IDs to prefetch (from RouterPredictor)
+            layer_index: Layer that will use these experts
+        """
+        if not predicted_experts:
+            return
+
+        async def schedule_task():
+            for expert_id in predicted_experts[:4]:  # Top 4 predictions
+                key: ExpertKey = (layer_index, expert_id)
+                try:
+                    async with self.prefetch_async(key):
+                        pass
+                except Exception as e:
+                    logger.debug(f"Could not schedule prefetch for {key}: {e}")
+
+        # Schedule in background if event loop exists
+        try:
+            asyncio.create_task(schedule_task())
+        except RuntimeError:
+            # No event loop running; skip prefetch scheduling
+            pass
+
+    def predict_and_prefetch(
+        self,
+        router_output: torch.Tensor,
+        current_layer_index: int,
+        next_layer_index: int,
+    ) -> None:
+        """Predict next experts from current router output and schedule prefetch.
+
+        Args:
+            router_output: Current layer's router selection (shape: [tokens, top_k])
+            current_layer_index: Index of current MoE layer
+            next_layer_index: Index of next MoE layer (to prefetch for)
+        """
+        if not isinstance(router_output, torch.Tensor) or router_output.ndim != 2:
+            return
+
+        try:
+            # Extract current expert IDs from router output
+            current_experts = router_output[:, 0].tolist() if router_output.numel() > 0 else []
+            current_experts = [int(e) for e in current_experts]
+
+            # Update predictor with current routing
+            self.predictor.record_router_bias(router_output.cpu().numpy())
+
+            # Predict next experts
+            predicted, scores = self.predictor.predict(current_experts)
+            if predicted and scores:
+                # Schedule prefetch for next layer
+                self.schedule_prefetch(predicted, next_layer_index)
+        except Exception as e:
+            logger.debug(f"Prefetch prediction failed: {e}")
+            # Graceful fallback: continue without prefetch
+
     def request_stats(self) -> dict[str, object]:
-        """Get stats from underlying sync pager."""
-        return self.sync_pager.request_stats()
+        """Get stats from underlying sync pager plus prefetch metrics."""
+        stats = self.sync_pager.request_stats()
+        stats.update({
+            "prefetch_scheduled": self._prefetch_scheduled,
+            "prefetch_hits": self._prefetch_hits,
+            "prefetch_misses": self._prefetch_misses,
+            "pending_tasks": len(self._pending),
+        })
+        return stats
 
     def clear_request_stats(self) -> None:
         """Clear stats on underlying sync pager."""
         self.sync_pager.clear_request_stats()
+        self._prefetch_hits = 0
+        self._prefetch_misses = 0
+        self._prefetch_scheduled = 0
 
     async def drain_pending(self) -> None:
         """Wait for all pending prefetches. Useful before shutdown."""
