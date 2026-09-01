@@ -19,6 +19,13 @@ class GenerationMetrics:
     cache_misses: int = 0
     expert_load_time_ms: float = 0.0
 
+    def cache_hit_rate(self) -> float:
+        """Return the expert cache hit rate as a value in [0, 1], or 0 if no accesses."""
+        total_accesses = self.cache_hits + self.cache_misses
+        if total_accesses == 0:
+            return 0.0
+        return self.cache_hits / total_accesses
+
     def to_dict(self) -> dict[str, int | float]:
         """Return the stable metric names used by the baseline."""
         return {
