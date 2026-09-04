@@ -85,16 +85,61 @@ def run(args: argparse.Namespace) -> int:
             progress_callback=progress_callback
         )
 
-        # TODO: Integrate state with InferenceEngine
-        print("\nResource-aware loading complete. Backend integration pending.")
-        print(f"Loaded model: {state.model_info.model_id}")
-        print(f"Is MoE: {state.model_info.is_moe}")
-        print(f"Shared weights: {len(state.shared_weights)} tensors")
+        print("\n" + "="*60)
+        print("Resource-aware loading complete. Starting inference...")
+        print("="*60 + "\n")
 
+        # Create inference engine with loaded state
+        engine = InferenceEngine(loaded_state=state)
+
+        # Generate text
+        result = engine.generate(args.prompt, args.max_new_tokens, args.temperature)
+
+        # Prepare output payload
+        payload = {
+            "text": result.text,
+            "token_ids": result.token_ids,
+            "metrics": result.metrics.to_dict(),
+            "capabilities": engine.capabilities.to_dict(),
+        }
+
+        # Add resource-aware loading statistics
         if state.model_info.is_moe:
             cache_stats = state.get_cache_stats()
-            print(f"Expert cache: GPU slots={state.expert_cache.gpu_slots}, CPU slots={state.expert_cache.cpu_slots}")
-            print(f"Cache stats: {cache_stats}")
+            payload["resource_aware_stats"] = {
+                "model_info": {
+                    "model_id": state.model_info.model_id,
+                    "is_moe": state.model_info.is_moe,
+                    "num_layers": state.model_info.num_layers,
+                    "num_experts": state.model_info.num_experts,
+                    "shared_weights_loaded": len(state.shared_weights),
+                },
+                "placement": {
+                    "shared_device": state.placement_plan.shared_device,
+                    "hot_expert_slots": state.placement_plan.hot_expert_slots,
+                    "warm_expert_slots": state.placement_plan.warm_expert_slots,
+                    "cold_expert_count": state.placement_plan.cold_expert_count,
+                    "gpu_utilization_pct": state.placement_plan.gpu_utilization_pct,
+                    "cpu_utilization_pct": state.placement_plan.cpu_utilization_pct,
+                },
+                "cache_stats": cache_stats,
+            }
+
+        # Print output
+        if args.json:
+            print(json.dumps(payload, sort_keys=True))
+        else:
+            print(result.text)
+            print("\n" + "="*60)
+            print("Generation Metrics:")
+            print("="*60)
+            print(json.dumps({"metrics": payload["metrics"], "capabilities": payload["capabilities"]}, indent=2, sort_keys=True))
+
+            if "resource_aware_stats" in payload:
+                print("\n" + "="*60)
+                print("Resource-Aware Loading Stats:")
+                print("="*60)
+                print(json.dumps(payload["resource_aware_stats"], indent=2, sort_keys=True))
 
         return 0
 

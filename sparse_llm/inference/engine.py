@@ -110,27 +110,13 @@ class InferenceEngine:
 
         Args:
             state: Pre-loaded weight state
-
-        Note:
-            This is a placeholder for future backend integration.
-            Currently stores the state but does not create a functional adapter.
         """
-        # Store state for future integration
+        from sparse_llm.models.preloaded_adapter import PreloadedWeightAdapter
+
+        # Create adapter that uses pre-loaded weights
+        self.adapter = PreloadedWeightAdapter(state)
         self._loaded_state = state
         self._last_result = None
-
-        # TODO: Create adapter that uses pre-loaded weights
-        # This requires ModelAdapter to accept LoadedWeightState
-        # For now, we raise NotImplementedError to indicate the integration point
-        raise NotImplementedError(
-            "Backend integration with LoadedWeightState is pending. "
-            "LoadedWeightState is ready and weights are loaded, but ModelAdapter "
-            "integration is needed to use these weights for inference. "
-            f"Model: {state.model_info.model_id}, "
-            f"Loaded: {len(state.shared_weights)} shared weights, "
-            f"Cache: {state.expert_cache.gpu_slots} GPU slots, "
-            f"{state.expert_cache.cpu_slots} CPU slots"
-        )
 
     @property
     def capabilities(self) -> ModelCapabilities:
