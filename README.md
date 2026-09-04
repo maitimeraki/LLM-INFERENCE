@@ -227,6 +227,33 @@ print(result.metrics.to_dict())
 print(engine.capabilities.to_dict())
 ```
 
+## Resource-Aware Weight Loading (Experimental)
+
+SparseLLM now supports automatic resource-aware weight loading that adapts to your hardware:
+
+```python
+from sparse_llm.loading import FourPhaseOrchestrator
+
+orchestrator = FourPhaseOrchestrator()
+state = orchestrator.initialize("mistralai/Mixtral-8x7B-Instruct-v0.1")
+
+# Model weights now optimally placed across GPU/CPU/storage
+# Cache statistics available via state.get_cache_stats()
+```
+
+**Command-line:**
+```bash
+python main.py --model gpt2 --prompt "Hello" --use-resource-aware
+```
+
+**Features:**
+- 🔍 **Automatic Detection**: Profiles GPU, CPU, and storage resources
+- 📊 **Smart Placement**: Calculates optimal three-tier weight distribution
+- ⚡ **LRU Caching**: Dynamic expert promotion/eviction between tiers
+- 📈 **Monitoring**: Real-time cache hit rates and performance metrics
+
+See [Resource-Aware Loading Guide](docs/RESOURCE_AWARE_LOADING_USAGE.md) for detailed usage and configuration.
+
 ## Current status and roadmap
 
 The current baseline prioritizes correctness and measurement:
@@ -234,7 +261,8 @@ The current baseline prioritizes correctness and measurement:
 1. universal lazy Transformers adapter and real generation;
 2. one canonical adapter-backed inference engine;
 3. layer-aware cache/storage primitives with safe eviction and atomic local I/O;
-4. capability reporting and safe fallback for unsupported MoE layouts.
+4. capability reporting and safe fallback for unsupported MoE layouts;
+5. **NEW**: resource-aware four-phase initialization with automatic hardware detection.
 
 After the baseline is measured, the roadmap is to add a validated Mixtral
 expert-module pager, established quantization backends, asynchronous transfer
