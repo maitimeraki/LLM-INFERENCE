@@ -1,7 +1,6 @@
 """Three-tier LRU expert cache for dynamic expert placement."""
 
 from __future__ import annotations
-import time
 from collections import OrderedDict
 from typing import Any
 
