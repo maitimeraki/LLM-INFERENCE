@@ -2,6 +2,7 @@
 
 from sparse_llm.cache import ExpertCache, ExpertKey
 from sparse_llm.inference.metrics import GenerationMetrics, GenerationResult
+from sparse_llm.integrations import UnifiedMemoryCoordinator
 from sparse_llm.models import (
     DevicePolicy,
     ModelAdapter,
@@ -25,6 +26,7 @@ __all__ = [
     "ModelCapabilities",
     "ModelRegistry",
     "TransformersCausalLMAdapter",
+    "UnifiedMemoryCoordinator",
     "UniversalMoEAdapter",
     "create_model_adapter",
     "get_default_registry",

@@ -4,6 +4,7 @@ This package provides the integration layer between SparseLLM's expert paging
 system and vLLM's serving infrastructure.
 """
 
+from sparse_llm.integrations.memory_coordinator import UnifiedMemoryCoordinator
 from sparse_llm.integrations.vllm_plugin import (
     VLLMSparseExpertPager,
     VLLMSparseMoELayer,
@@ -12,6 +13,7 @@ from sparse_llm.integrations.vllm_plugin import (
 )
 
 __all__ = [
+    "UnifiedMemoryCoordinator",
     "VLLMSparseExpertPager",
     "VLLMSparseMoELayer",
     "replace_moe_layers_with_paged",
