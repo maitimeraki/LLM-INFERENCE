@@ -1,1 +1,1 @@
-"""Weight loading system for SparseLLM."""
+"""Loading module for resource-aware weight loading."""
