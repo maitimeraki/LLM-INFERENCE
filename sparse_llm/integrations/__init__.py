@@ -5,6 +5,7 @@ system and vLLM's serving infrastructure.
 """
 
 from sparse_llm.integrations.memory_coordinator import UnifiedMemoryCoordinator
+from sparse_llm.integrations.weight_bridge import SparseMoEWeightBridge
 from sparse_llm.integrations.vllm_plugin import (
     VLLMSparseExpertPager,
     VLLMSparseMoELayer,
@@ -14,6 +15,7 @@ from sparse_llm.integrations.vllm_plugin import (
 
 __all__ = [
     "UnifiedMemoryCoordinator",
+    "SparseMoEWeightBridge",
     "VLLMSparseExpertPager",
     "VLLMSparseMoELayer",
     "replace_moe_layers_with_paged",
