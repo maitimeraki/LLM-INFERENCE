@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from sparse_llm.models.adapters import DevicePolicy, ModelAdapter, ModelCapabilities
 from sparse_llm.models.registry import ModelRegistry, create_model_adapter, get_default_registry
+
+if TYPE_CHECKING:
+    from sparse_llm.loading.loaded_weight_state import LoadedWeightState
 
 
 class InferenceEngine:
@@ -30,17 +33,45 @@ class InferenceEngine:
         expert_cache_bytes: int | None = None,
         registry: ModelRegistry | None = None,
         adapter: ModelAdapter | None = None,
+        loaded_state: "LoadedWeightState | None" = None,
     ) -> None:
+        """Initialize inference engine.
+
+        Args:
+            model: Hugging Face model ID, local path, or ModelAdapter instance
+            model_name: Alternative way to specify model (deprecated, use model)
+            device: Device placement ("auto", "cuda", "cpu")
+            dtype: Model dtype ("float32", "float16", "bfloat16")
+            revision: Model revision/commit hash
+            local_files_only: Don't download, use cached files only
+            trust_remote_code: Allow custom model code execution
+            device_map: Transformers device map for multi-GPU
+            offload_folder: Folder for CPU offloading
+            expert_cache_bytes: Expert cache size in bytes
+            registry: Custom model registry
+            adapter: Pre-constructed adapter
+            loaded_state: Pre-loaded weight state from resource-aware loading.
+                         If provided, bypasses traditional model loading.
+        """
         if model is not None and model_name is not None:
             raise ValueError("pass either model or model_name, not both")
         if adapter is not None and (model is not None or model_name is not None):
             raise ValueError("pass adapter or model, not both")
+        if loaded_state is not None and (model is not None or model_name is not None or adapter is not None):
+            raise ValueError("loaded_state cannot be combined with model or adapter")
         if expert_cache_bytes is not None and (
             not isinstance(expert_cache_bytes, int)
             or isinstance(expert_cache_bytes, bool)
             or expert_cache_bytes < 1
         ):
             raise ValueError("expert_cache_bytes must be a positive integer")
+
+        # Handle resource-aware loaded state
+        if loaded_state is not None:
+            self._initialize_from_loaded_state(loaded_state)
+            return
+
+        # Traditional loading path
         source = model if model is not None else model_name
         if adapter is None:
             if isinstance(source, ModelAdapter):
@@ -72,6 +103,34 @@ class InferenceEngine:
                 raise ValueError("a model identifier/path or adapter is required")
         self.adapter = adapter
         self._last_result = None
+        self._loaded_state = None
+
+    def _initialize_from_loaded_state(self, state: "LoadedWeightState") -> None:
+        """Initialize from resource-aware loaded state.
+
+        Args:
+            state: Pre-loaded weight state
+
+        Note:
+            This is a placeholder for future backend integration.
+            Currently stores the state but does not create a functional adapter.
+        """
+        # Store state for future integration
+        self._loaded_state = state
+        self._last_result = None
+
+        # TODO: Create adapter that uses pre-loaded weights
+        # This requires ModelAdapter to accept LoadedWeightState
+        # For now, we raise NotImplementedError to indicate the integration point
+        raise NotImplementedError(
+            "Backend integration with LoadedWeightState is pending. "
+            "LoadedWeightState is ready and weights are loaded, but ModelAdapter "
+            "integration is needed to use these weights for inference. "
+            f"Model: {state.model_info.model_id}, "
+            f"Loaded: {len(state.shared_weights)} shared weights, "
+            f"Cache: {state.expert_cache.gpu_slots} GPU slots, "
+            f"{state.expert_cache.cpu_slots} CPU slots"
+        )
 
     @property
     def capabilities(self) -> ModelCapabilities:
