@@ -7,13 +7,11 @@ from typing import Callable, Any
 
 import torch
 from safetensors import safe_open
-from safetensors.torch import load_file
 from huggingface_hub import snapshot_download
 
 from sparse_llm.loading.placement_plan import PlacementPlan
 from sparse_llm.loading.expert_cache import ExpertCache
 from sparse_llm.loading.loaded_weight_state import LoadedWeightState
-from sparse_llm.models.shared_weight_loader import SharedWeightPlacer
 
 
 class WeightLoader:
@@ -45,7 +43,7 @@ class WeightLoader:
         model_path = self._ensure_model_downloaded(model_id, log)
 
         # Step 2: Load shared weights to target device
-        log("[1/4] Loading shared weights to GPU...")
+        log(f"[1/4] Loading shared weights to {plan.shared_device}...")
         shared_weights = self._load_shared_weights(model_path, plan, log)
 
         # Step 3: Initialize expert cache
@@ -180,13 +178,12 @@ class WeightLoader:
         safetensors_files = list(model_path.glob("*.safetensors"))
 
         for st_file in safetensors_files:
-            weights = load_file(st_file, device="cpu")
-
-            for key, tensor in weights.items():
-                # Check if matches expert pattern
-                for pattern in patterns:
-                    if self._matches_pattern(key, pattern):
-                        expert_weights[key] = tensor
+            with safe_open(st_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    # Check if matches expert pattern
+                    for pattern in patterns:
+                        if self._matches_pattern(key, pattern):
+                            expert_weights[key] = f.get_tensor(key)
 
         if not expert_weights:
             raise ValueError(f"No weights found for expert ({layer_id}, {expert_id})")
@@ -215,8 +212,9 @@ class WeightLoader:
 
     def _format_bytes(self, bytes: int) -> str:
         """Format bytes as human-readable string."""
+        value = bytes
         for unit in ['B', 'KB', 'MB', 'GB']:
-            if bytes < 1024:
-                return f"{bytes:.1f}{unit}"
-            bytes /= 1024
-        return f"{bytes:.1f}TB"
+            if value < 1024:
+                return f"{value:.1f}{unit}"
+            value /= 1024
+        return f"{value:.1f}TB"

@@ -27,8 +27,7 @@ def test_weight_loader_mock_load():
     # Mock Path.exists and snapshot_download
     with patch('sparse_llm.loading.weight_loader.Path') as mock_path_cls, \
          patch('sparse_llm.loading.weight_loader.snapshot_download') as mock_snapshot, \
-         patch('sparse_llm.loading.weight_loader.safe_open') as mock_safe_open, \
-         patch('sparse_llm.loading.weight_loader.load_file') as mock_load_file:
+         patch('sparse_llm.loading.weight_loader.safe_open') as mock_safe_open:
 
         # Mock Path behavior
         mock_path = MagicMock()
@@ -40,22 +39,16 @@ def test_weight_loader_mock_load():
         import torch
         mock_file = MagicMock()
         mock_file.__enter__.return_value = mock_file
-        mock_file.keys.return_value = ["model.embed_tokens.weight", "model.norm.weight"]
+        mock_file.keys.return_value = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.0.w2.weight",
+            "model.layers.0.block_sparse_moe.experts.1.w1.weight",
+            "model.layers.0.block_sparse_moe.experts.1.w2.weight",
+        ]
         mock_file.get_tensor.return_value = torch.randn(100, 100)
         mock_safe_open.return_value = mock_file
-
-        # Mock load_file for expert loading - provide weights for multiple experts
-        def mock_load_file_side_effect(path, device):
-            # Return different weights based on which expert is being loaded
-            return {
-                "model.layers.0.block_sparse_moe.experts.0.w1.weight": torch.randn(128, 128),
-                "model.layers.0.block_sparse_moe.experts.0.w2.weight": torch.randn(128, 128),
-                "model.layers.0.block_sparse_moe.experts.1.w1.weight": torch.randn(128, 128),
-                "model.layers.0.block_sparse_moe.experts.1.w2.weight": torch.randn(128, 128),
-                "model.layers.1.block_sparse_moe.experts.0.w1.weight": torch.randn(128, 128),
-                "model.layers.1.block_sparse_moe.experts.0.w2.weight": torch.randn(128, 128),
-            }
-        mock_load_file.side_effect = mock_load_file_side_effect
 
         # Load
         state = loader.load("test-model", plan, progress_callback=progress_callback)
