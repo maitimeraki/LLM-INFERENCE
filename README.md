@@ -47,6 +47,23 @@ The runtime automatically:
 - A model that does not fit the requested device policy fails with an actionable
   error; the project does not promise that every model fits in a fixed VRAM size.
 
+## WSL + VLLM Zero-Latency Setup
+
+**For Windows users with WSL:** SparseLLM provides a zero-latency VLLM integration by running everything in WSL while keeping your code on the C: drive.
+
+📘 **See [ZERO_LATENCY_GUIDE.md](ZERO_LATENCY_GUIDE.md)** for complete setup and usage
+
+Quick start:
+```bash
+# From Windows
+run.bat inference --model mistralai/Mixtral-8x7B --prompt "Hello"
+
+# Benchmark latency
+run.bat benchmark
+```
+
+**Architecture:** [WSL_VLLM_ARCHITECTURE.md](WSL_VLLM_ARCHITECTURE.md) - Technical details on the zero-overhead design
+
 ## Installation
 
 ```bash

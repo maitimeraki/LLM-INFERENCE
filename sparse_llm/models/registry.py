@@ -81,6 +81,7 @@ class ModelRegistry:
 
 
 _DEFAULT_REGISTRY = ModelRegistry()
+# Mixtral adapter kept for backward compatibility with existing paging hooks
 _DEFAULT_REGISTRY.register(
     "mixtral",
     lambda model_id, *, policy=None, config=None, **kwargs: MixtralAdapter(
@@ -89,6 +90,8 @@ _DEFAULT_REGISTRY.register(
     is_mixtral_config,
     priority=10,
 )
+# All other MoE models (Qwen2MoE, DeepSeek, etc.) use generic TransformersCausalLMAdapter
+# which now has universal MoE detection and tiered placement
 
 
 def get_default_registry() -> ModelRegistry:

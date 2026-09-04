@@ -39,9 +39,12 @@ class DevicePolicy:
             raise ValueError(f"unsupported device {self.device!r}")
         requested = self.device.lower()
         if requested == "auto":
-            requested = "cuda" if torch.cuda.is_available() else "cpu"
-        if requested.startswith("cuda") and not torch.cuda.is_available():
-            raise RuntimeError("CUDA was requested but no CUDA device is available")
+            requested = "cuda" if torch.cuda.is_available() and torch.backends.cuda.is_built() else "cpu"
+        if requested.startswith("cuda"):
+            if not torch.cuda.is_available():
+                raise RuntimeError("CUDA was requested but torch.cuda is not available (PyTorch not compiled with CUDA)")
+            if not torch.backends.cuda.is_built():
+                raise RuntimeError("CUDA was requested but PyTorch was compiled without CUDA support. Reinstall PyTorch with CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu118")
         try:
             return torch.device(requested)
         except (RuntimeError, ValueError) as error:
@@ -189,23 +192,70 @@ class TransformersCausalLMAdapter(ModelAdapter):
             common = {key: value for key, value in common.items() if value is not None}
             if self.tokenizer is None:
                 self.tokenizer = tokenizer_loader.from_pretrained(self.model_id, **common)
+
+            # Load config first to check if this is MoE before loading model weights
+            if self.config is None:
+                try:
+                    from transformers import AutoConfig
+                    self.config = AutoConfig.from_pretrained(self.model_id, **common)
+                except Exception:
+                    pass  # Config will be loaded from model later
+
             if self.model is None:
                 model_kwargs = dict(common)
                 dtype = self.policy.torch_dtype()
                 if dtype is not None:
                     model_kwargs["torch_dtype"] = dtype
-                if self.policy.device_map is not None:
-                    model_kwargs["device_map"] = self.policy.device_map
-                if self.policy.offload_folder is not None:
+
+                # Check if this is an MoE model that needs special handling
+                is_moe = self._is_moe_model()
+                cuda_available = torch.cuda.is_available() and torch.backends.cuda.is_built()
+
+                if is_moe:
+                    # MoE models: Use safe loading to avoid segfaults from memory-mapping many experts
+                    # Strategy: Load with device_map for efficient placement, then apply tiered optimization
+                    model_kwargs["low_cpu_mem_usage"] = True
+
+                    # Use device_map="auto" if specified or if we have GPU + offload_folder
+                    if self.policy.device_map is not None:
+                        model_kwargs["device_map"] = self.policy.device_map
+                    elif cuda_available and self.policy.offload_folder is not None:
+                        model_kwargs["device_map"] = "auto"
+
+                    if self.policy.offload_folder is not None:
+                        model_kwargs["offload_folder"] = self.policy.offload_folder
+                elif self.policy.offload_folder is not None and self.policy.device_map in ("auto", None) and cuda_available:
+                    # Dense models with GPU: use max_memory for automatic placement
+                    model_kwargs["max_memory"] = self._compute_max_memory()
                     model_kwargs["offload_folder"] = self.policy.offload_folder
+                elif self.policy.offload_folder is not None and self.policy.device_map in ("auto", None) and not cuda_available:
+                    # CPU-only with offload: use max_memory without CUDA keys
+                    model_kwargs["max_memory"] = {"cpu": "4GB"}
+                    model_kwargs["offload_folder"] = self.policy.offload_folder
+                elif self.policy.device_map is not None:
+                    model_kwargs["device_map"] = self.policy.device_map
+                    if self.policy.offload_folder is not None and cuda_available:
+                        model_kwargs["offload_folder"] = self.policy.offload_folder
+
                 self.model = model_loader.from_pretrained(self.model_id, **model_kwargs)
 
         if self.model is None or self.tokenizer is None:  # pragma: no cover - loader contract
             raise RuntimeError("model and tokenizer loaders returned no objects")
-        if self.policy.device_map is None:
+
+        # Apply device placement based on model type and user configuration
+        if self._is_moe_model():
+            # MoE models: Apply tiered placement if device_map wasn't used
+            # If device_map was used, Transformers already placed weights, but we can still optimize
+            if self.policy.device_map is None:
+                # No device_map: manually place shared weights on GPU, experts on CPU
+                self._apply_tiered_placement()
+            # else: device_map already placed weights, trust Transformers' placement
+        elif self.policy.device_map is None:
+            # Dense models without device_map: simple device placement
             target = self.policy.resolve_device()
             if hasattr(self.model, "to"):
                 self.model.to(target)
+
         if hasattr(self.model, "eval"):
             self.model.eval()
         self.config = self.config or getattr(self.model, "config", None)
@@ -258,7 +308,7 @@ class TransformersCausalLMAdapter(ModelAdapter):
                 next_token = self._select_token(logits, temperature)
                 full_ids = torch.cat((full_ids, next_token[:, None]), dim=1)
                 generated += 1
-                if eos_ids and int(next_token.item()) in eos_ids:
+                if eos_ids and next_token.device.type != "meta" and int(next_token.item()) in eos_ids:
                     break
                 attention_mask = torch.cat(
                     (attention_mask, torch.ones((1, 1), dtype=attention_mask.dtype, device=attention_mask.device)),
@@ -300,6 +350,93 @@ class TransformersCausalLMAdapter(ModelAdapter):
             ),
         )
 
+    def _compute_max_memory(self) -> dict[str, int | str]:
+        """Compute max_memory dict for device-aware offloading without alignment bugs.
+
+        Returns dict mapping device names to memory budgets, enabling transformers
+        to automatically offload to CPU/disk without triggering memory-mapping alignment issues.
+        Prioritizes VRAM over CPU when both are available.
+        """
+        max_mem = {}
+        # Reserve ~85% of VRAM for model layers when CUDA is actually compiled
+        if torch.cuda.is_available() and torch.backends.cuda.is_built():
+            try:
+                for i in range(torch.cuda.device_count()):
+                    total_mem = torch.cuda.get_device_properties(i).total_memory
+                    max_mem[f"cuda:{i}"] = int(total_mem * 0.85)
+            except (RuntimeError, AssertionError):
+                pass
+        # CPU: conservative 4GB budget before hitting disk via offload_folder
+        # For CPU-only: use offload_folder for efficient disk-based loading
+        max_mem["cpu"] = "4GB"
+        return max_mem
+
+    def _is_moe_model(self) -> bool:
+        """Check if current model is MoE architecture.
+
+        Universal detection: checks for expert-related attributes without hardcoding model types.
+        """
+        if self.config is None:
+            return False
+
+        # Check for expert count attributes (various naming conventions)
+        expert_count = self._first_int(
+            self.config,
+            "num_local_experts",
+            "num_experts",
+            "n_routed_experts",
+            "num_expert_ffn",
+            "moe_num_experts"
+        )
+
+        # MoE models have multiple experts (>1)
+        if expert_count is not None and expert_count > 1:
+            return True
+
+        # Additional signal: presence of top-k routing parameter
+        top_k = self._first_int(
+            self.config,
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "num_selected_experts",
+            "top_k",
+            "moe_top_k"
+        )
+        if top_k is not None and top_k > 0:
+            return True
+
+        return False
+
+    def _apply_tiered_placement(self) -> None:
+        """Apply tiered memory placement: shared weights on fastest device, experts on slower tier.
+
+        Strategy:
+        - GPU available: shared → GPU, experts → CPU
+        - CPU only: shared → CPU, experts stay on CPU (will page from disk if offload_folder set)
+        """
+        if self.model is None or self.config is None:
+            return
+
+        from sparse_llm.models.shared_weight_loader import SharedWeightPlacer
+
+        # Determine target device for shared weights
+        target_device = self.policy.resolve_device() if torch.cuda.is_available() and torch.backends.cuda.is_built() else torch.device("cpu")
+
+        # Create weight classifier
+        placer = SharedWeightPlacer(self.config)
+
+        # Move shared weights to target device, keep experts on CPU
+        for name, param in self.model.named_parameters():
+            classification = placer.classify_tensor(name)
+            if classification == "shared":
+                # Shared weights go to fastest available device
+                if param.device != target_device:
+                    param.data = param.data.to(target_device, non_blocking=True)
+            elif classification == "expert":
+                # Experts stay on CPU for on-demand paging
+                if param.device.type != "cpu":
+                    param.data = param.data.to("cpu")
+
     def _loaders(self) -> tuple[Any, Any]:
         if self._tokenizer_loader is not None and self._model_loader is not None:
             return self._tokenizer_loader, self._model_loader
@@ -317,12 +454,17 @@ class TransformersCausalLMAdapter(ModelAdapter):
         model_type = getattr(config, "model_type", None)
         architectures = getattr(config, "architectures", None) or []
         architecture = architectures[0] if architectures else type(model).__name__ if model is not None else None
-        expert_count = self._first_int(config, "num_local_experts", "num_experts", "n_routed_experts")
-        top_k = self._first_int(config, "num_experts_per_tok", "num_experts_per_token", "num_selected_experts", "top_k")
+        expert_count = self._first_int(config, "num_local_experts", "num_experts", "n_routed_experts", "num_expert_ffn", "moe_num_experts")
+        top_k = self._first_int(config, "num_experts_per_tok", "num_experts_per_token", "num_selected_experts", "top_k", "moe_top_k")
         layers = self._first_int(config, "num_hidden_layers", "n_layer", "num_layers")
-        is_moe = expert_count is not None or top_k is not None
+        is_moe = expert_count is not None and expert_count > 1
         classification = "moe" if is_moe else "dense"
         supports_kv = bool(getattr(config, "use_cache", True))
+
+        # Enable expert_paging universally for all detected MoE models
+        # No model_type whitelist - if it has experts, it can use paging
+        expert_paging = is_moe
+
         return ModelCapabilities(
             model_id=self.model_id,
             model_type=model_type,
@@ -331,7 +473,7 @@ class TransformersCausalLMAdapter(ModelAdapter):
             is_moe=is_moe,
             supports_generation=True,
             supports_kv_cache=supports_kv,
-            expert_paging=False,
+            expert_paging=expert_paging,
             num_hidden_layers=layers,
             num_experts=expert_count,
             top_k_experts=top_k,

@@ -1,7 +1,6 @@
 """System resource profiling with hardware detection and safety margins."""
 
 from __future__ import annotations
-import os
 import platform
 from pathlib import Path
 

@@ -67,8 +67,11 @@ class RouterSelection:
         if self.expert_indices.dtype not in (torch.int8, torch.int16, torch.int32, torch.int64):
             raise ValueError("router expert indices must use an integer dtype")
         if self.expert_indices.numel():
-            minimum = int(self.expert_indices.min().item())
-            maximum = int(self.expert_indices.max().item())
+            if self.expert_indices.device.type != "meta":
+                minimum = int(self.expert_indices.min().item())
+                maximum = int(self.expert_indices.max().item())
+            else:
+                minimum, maximum = 0, num_experts - 1
             if minimum < 0 or maximum >= num_experts:
                 raise ValueError(
                     f"router expert index range [{minimum}, {maximum}] is outside "

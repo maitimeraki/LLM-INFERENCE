@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
-
+import os
+from dotenv import load_dotenv
+load_dotenv()
 from sparse_llm import DevicePolicy, InferenceEngine
-
+os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(

@@ -20,6 +20,11 @@ dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
 ]
+vllm = [
+    "vllm>=0.28.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+]
 
 [project.scripts]
 sparse-llm = "main:main"

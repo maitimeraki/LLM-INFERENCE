@@ -56,7 +56,18 @@ class InferenceEngine:
                     offload_folder=offload_folder,
                     expert_cache_bytes=expert_cache_bytes,
                 )
-                adapter = (registry or get_default_registry()).create(source, policy=policy)
+                # Pre-load config so registry can select correct specialization (e.g., Qwen2MoEAdapter)
+                try:
+                    from transformers import AutoConfig
+                    config = AutoConfig.from_pretrained(
+                        source,
+                        revision=revision,
+                        local_files_only=local_files_only,
+                        trust_remote_code=trust_remote_code,
+                    )
+                except Exception:
+                    config = None
+                adapter = (registry or get_default_registry()).create(source, policy=policy, config=config)
             else:
                 raise ValueError("a model identifier/path or adapter is required")
         self.adapter = adapter

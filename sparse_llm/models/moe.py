@@ -76,11 +76,11 @@ class SparseMoELayer(nn.Module):
             for batch_idx in range(batch_size):
                 expert_out = torch.zeros(self.expert_dim, device=x.device, dtype=x.dtype)
                 for k in range(self.top_k):
-                    expert_id = selected_experts[batch_idx, k].item()
-                    expert_prob = gate_probs[batch_idx, k]
-
-                    if expert_id < len(self.experts):
-                        expert_out += expert_prob * self.experts[expert_id](token[batch_idx])
+                    if selected_experts.device.type != "meta":
+                        expert_id = int(selected_experts[batch_idx, k].item())
+                        expert_prob = gate_probs[batch_idx, k]
+                        if expert_id < len(self.experts):
+                            expert_out += expert_prob * self.experts[expert_id](token[batch_idx])
 
                 output[t, batch_idx] = expert_out
 
