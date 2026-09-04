@@ -1,19 +1,43 @@
 #!/usr/bin/env python3
-"""Unified Production Server: Resource-Aware Loading + vLLM Serving
+"""Unified Production Server: Conflict-Free vLLM Integration
 
-This server combines SparseLLM's resource-aware 4-phase loading with vLLM's
-high-performance serving infrastructure.
+This server integrates SparseLLM's resource-aware 4-phase loading with vLLM's
+high-performance serving infrastructure without conflicts.
 
-Architecture:
-1. Phase 1-4: Use FourPhaseOrchestrator to load weights intelligently
-2. Initialize vLLM AsyncLLMEngine with pre-loaded weights
-3. Expose OpenAI-compatible API endpoints
-4. Persist weights across requests until shutdown
+KEY INTEGRATION POINTS:
 
-Usage:
+1. UnifiedMemoryCoordinator: Splits GPU memory (40% expert cache, 50% KV cache)
+   to prevent OOM conflicts between systems.
+
+2. SparseMoEWeightBridge: Makes vLLM use pre-loaded weights from LoadedWeightState
+   instead of loading from scratch (eliminates duplicate loading).
+
+3. Weight Injection: Replaces vLLM's model parameters with pre-loaded weights
+   during engine initialization (single source of truth for weights).
+
+ARCHITECTURE:
+
+Phase 1: Resource-Aware Loading
+  FourPhaseOrchestrator loads weights across GPU/CPU/Storage tiers
+  Creates LoadedWeightState with shared_weights and expert_cache
+
+Phase 2: vLLM Integration
+  UnifiedMemoryCoordinator establishes memory budgets
+  SparseMoEWeightBridge connects vLLM to LoadedWeightState
+  AsyncLLMEngine initialized with coordinated config
+  Weights injected from LoadedWeightState (no duplicate loading)
+
+Phase 3: Serving
+  OpenAI-compatible API endpoints
+  Request batching with vLLM scheduler
+  Persistent weights across requests
+
+USAGE:
+
     python serve.py --model mistralai/Mixtral-8x7B-Instruct-v0.1
-    python serve.py --model mistralai/Mixtral-8x7B-Instruct-v0.1 --port 8080
-    python serve.py --model meta-llama/Llama-3.1-8B --host 0.0.0.0 --port 8000
+    python serve.py --model meta-llama/Llama-3.1-8B --port 8080
+
+See docs/VLLM_INTEGRATION.md for complete documentation.
 """
 
 from __future__ import annotations

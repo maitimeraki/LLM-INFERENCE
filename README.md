@@ -254,6 +254,32 @@ python main.py --model gpt2 --prompt "Hello" --use-resource-aware
 
 See [Resource-Aware Loading Guide](docs/RESOURCE_AWARE_LOADING_USAGE.md) for detailed usage and configuration.
 
+## Production Serving with vLLM
+
+For high-throughput production serving, use `serve.py` which integrates resource-aware loading with vLLM:
+
+```bash
+# Start production server
+python serve.py --model mistralai/Mixtral-8x7B-Instruct-v0.1
+
+# Server exposes OpenAI-compatible API
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "messages": [{"role": "user", "content": "Hello!"}]
+  }'
+```
+
+### Key Features
+
+- **Memory Efficient**: Run 176B models on 24GB GPU via 3-tier caching
+- **High Throughput**: vLLM batching with expert-aware scheduling
+- **Persistent Weights**: Load once, serve many requests
+- **OpenAI Compatible**: Drop-in replacement for OpenAI API
+
+See [docs/VLLM_INTEGRATION.md](docs/VLLM_INTEGRATION.md) for details.
+
 ## Current status and roadmap
 
 The current baseline prioritizes correctness and measurement:
