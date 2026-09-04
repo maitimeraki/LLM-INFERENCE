@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Reserved expert-paging budget in bytes; generic adapters do not page experts",
     )
+    parser.add_argument(
+        "--use-resource-aware",
+        action="store_true",
+        help="Use resource-aware four-phase initialization (experimental)"
+    )
     parser.add_argument("--json", action="store_true", help="Print a JSON result")
     return parser
 
@@ -65,6 +70,35 @@ def run(args: argparse.Namespace) -> int:
     if args.cache_bytes is not None and args.cache_bytes < 1:
         raise ValueError("--cache-bytes must be positive")
 
+    # Resource-aware loading path (experimental)
+    if args.use_resource_aware:
+        from sparse_llm.loading import FourPhaseOrchestrator
+
+        print("Using resource-aware initialization...")
+        orchestrator = FourPhaseOrchestrator()
+
+        def progress_callback(message: str):
+            print(message)
+
+        state = orchestrator.initialize(
+            model_id=args.model,
+            progress_callback=progress_callback
+        )
+
+        # TODO: Integrate state with InferenceEngine
+        print("\nResource-aware loading complete. Backend integration pending.")
+        print(f"Loaded model: {state.model_info.model_id}")
+        print(f"Is MoE: {state.model_info.is_moe}")
+        print(f"Shared weights: {len(state.shared_weights)} tensors")
+
+        if state.model_info.is_moe:
+            cache_stats = state.get_cache_stats()
+            print(f"Expert cache: GPU slots={state.expert_cache.gpu_slots}, CPU slots={state.expert_cache.cpu_slots}")
+            print(f"Cache stats: {cache_stats}")
+
+        return 0
+
+    # Traditional loading path (existing code)
     policy = DevicePolicy(
         device=args.device,
         dtype=args.dtype,
