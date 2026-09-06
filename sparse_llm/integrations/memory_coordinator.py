@@ -57,8 +57,9 @@ class UnifiedMemoryCoordinator:
             - max_num_seqs: Maximum batch size
             - enforce_eager: Whether to disable CUDA graphs
         """
-        # vLLM sees 50% of usable memory, which is 50%/85% = 58.8% of total
-        gpu_memory_utilization = self.KV_CACHE_RATIO / self.SAFETY_MARGIN
+        # Set very low GPU utilization (1%) to prevent vLLM from loading weights
+        # We inject pre-loaded weights after engine creation
+        gpu_memory_utilization = 0.01
 
         return {
             "gpu_memory_utilization": gpu_memory_utilization,
