@@ -5,6 +5,8 @@ Public API:
     LoadedWeightState: Result container with weights and cache
     ResourceBudget: Hardware capacity information
     PlacementPlan: Weight placement strategy
+    ModelAnalyzer: Precision-aware model analysis
+    PrecisionCalculator: Precision-aware byte calculations
 
 Usage:
     >>> from sparse_llm.loading import FourPhaseOrchestrator
@@ -19,6 +21,8 @@ from sparse_llm.loading.resource_budget import ResourceBudget, GPUInfo, CPUInfo,
 from sparse_llm.loading.placement_plan import PlacementPlan
 from sparse_llm.loading.model_introspector import ModelInfo
 from sparse_llm.loading.expert_cache import ExpertCache
+from sparse_llm.loading.precision_calculator import Precision, PrecisionCalculator, PrecisionMemoryProfile
+from sparse_llm.loading.model_analyzer import ModelAnalyzer, ModelAnalysis
 
 __all__ = [
     "FourPhaseOrchestrator",
@@ -30,4 +34,9 @@ __all__ = [
     "PlacementPlan",
     "ModelInfo",
     "ExpertCache",
+    "Precision",
+    "PrecisionCalculator",
+    "PrecisionMemoryProfile",
+    "ModelAnalyzer",
+    "ModelAnalysis",
 ]
