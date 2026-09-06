@@ -164,10 +164,9 @@ class UnifiedServer:
         if state.model_info.is_moe:
             logger.info(f"   Layers: {state.model_info.num_layers}")
             logger.info(f"   Experts: {state.model_info.num_experts}")
-            cache_stats = state.get_cache_stats()
-            logger.info(f"   GPU cache: {cache_stats['gpu_cached_experts']} experts")
-            logger.info(f"   CPU cache: {cache_stats['cpu_cached_experts']} experts")
-            logger.info(f"   Storage: {cache_stats['storage_experts']} experts")
+            logger.info(f"   GPU cache: {state.placement_plan.hot_expert_slots} experts")
+            logger.info(f"   CPU cache: {state.placement_plan.warm_expert_slots} experts")
+            logger.info(f"   Storage: {state.placement_plan.cold_expert_count} experts")
 
         return state
 
