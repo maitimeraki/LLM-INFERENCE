@@ -207,6 +207,7 @@ class UnifiedServer:
             model=self.model,
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
+            disable_v1=True,  # Disable V1 engine (UVA not available in WSL)
             **vllm_config,  # Includes gpu_memory_utilization, enforce_eager, etc.
         )
 
