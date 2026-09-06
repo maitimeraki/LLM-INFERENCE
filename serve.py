@@ -83,6 +83,7 @@ except ImportError:
 
 # SparseLLM imports
 from sparse_llm.loading import FourPhaseOrchestrator, LoadedWeightState
+from sparse_llm.integrations.vllm_bridge import initialize_vllm_with_coordination
 
 
 # Configure logging
@@ -128,163 +129,84 @@ class UnifiedServer:
         # Runtime state
         self.loaded_state: LoadedWeightState | None = None
         self.vllm_engine: AsyncLLMEngine | None = None
-        self.memory_coordinator = None
         self.weight_bridge = None
+        self.allocation = None  # NEW: Memory allocation info
         self.startup_time: float = 0.0
         self.request_count: int = 0
 
-    def load_weights_resource_aware(self) -> LoadedWeightState:
-        """Phase 1: Load weights using resource-aware orchestrator.
+    async def initialize_vllm_with_coordination_method(self):
+        """Initialize vLLM using OOM-safe coordination (NEW METHOD).
+
+        This replaces the old two-phase approach with a single coordinated initialization
+        that prevents OOM by pre-calculating memory allocation.
 
         Returns:
-            LoadedWeightState containing pre-loaded weights
+            Tuple of (vllm_engine, weight_bridge, memory_allocation, loaded_state)
         """
         logger.info("="*70)
-        logger.info("PHASE 1: RESOURCE-AWARE WEIGHT LOADING")
+        logger.info("🚀 OOM-SAFE INITIALIZATION (Memory-Coordinated)")
         logger.info("="*70)
 
-        orchestrator = FourPhaseOrchestrator()
-
-        def progress_callback(message: str):
-            logger.info(message)
-
         phase_start = time.time()
-        state = orchestrator.initialize(
+
+        # Use the new OOM-safe initialization function
+        vllm_engine, weight_bridge, memory_allocation = initialize_vllm_with_coordination(
             model_id=self.model,
-            storage_path=self.storage_path,
-            progress_callback=progress_callback
-        )
-        phase_time = time.time() - phase_start
-
-        logger.info("")
-        logger.info(f"✅ Resource-aware loading complete in {phase_time:.1f}s")
-        logger.info(f"   Model: {state.model_info.model_id}")
-        logger.info(f"   Type: {'MoE' if state.model_info.is_moe else 'Dense'}")
-
-        if state.model_info.is_moe:
-            logger.info(f"   Layers: {state.model_info.num_layers}")
-            logger.info(f"   Experts: {state.model_info.num_experts}")
-            logger.info(f"   GPU cache: {state.placement_plan.hot_expert_slots} experts")
-            logger.info(f"   CPU cache: {state.placement_plan.warm_expert_slots} experts")
-            logger.info(f"   Storage: {state.placement_plan.cold_expert_count} experts")
-
-        return state
-
-    async def initialize_vllm_engine(self, loaded_state: LoadedWeightState) -> AsyncLLMEngine:
-        """Phase 2: Initialize vLLM engine with pre-loaded weights.
-
-        Args:
-            loaded_state: Pre-loaded weight state from Phase 1
-
-        Returns:
-            Initialized AsyncLLMEngine using pre-loaded weights
-        """
-        logger.info("")
-        logger.info("="*70)
-        logger.info("PHASE 2: vLLM ENGINE INITIALIZATION WITH WEIGHT BRIDGE")
-        logger.info("="*70)
-
-        phase_start = time.time()
-
-        # Step 1: Create memory coordinator
-        logger.info("🔧 Creating unified memory coordinator...")
-        from sparse_llm.integrations import UnifiedMemoryCoordinator
-
-        total_gpu_bytes = torch.cuda.get_device_properties(0).total_memory
-        self.memory_coordinator = UnifiedMemoryCoordinator(total_gpu_bytes)
-
-        # Step 2: Create weight bridge
-        logger.info("🌉 Creating weight bridge from LoadedWeightState...")
-        from sparse_llm.integrations import SparseMoEWeightBridge
-
-        self.weight_bridge = SparseMoEWeightBridge(loaded_state)
-
-        # Step 3: Create vLLM engine with memory-coordinated config
-        logger.info("🚀 Creating vLLM AsyncLLMEngine...")
-
-        vllm_config = self.memory_coordinator.get_vllm_config()
-        engine_args = AsyncEngineArgs(
-            model=self.model,
-            tensor_parallel_size=self.tensor_parallel_size,
-            max_model_len=self.max_model_len,
-            **vllm_config,  # Includes gpu_memory_utilization, enforce_eager, etc.
+            user_vllm_params={
+                "max_model_len": self.max_model_len,
+                "tensor_parallel_size": self.tensor_parallel_size,
+                "gpu_memory_utilization": self.gpu_memory_utilization,  # Will be overridden by calculator
+            },
+            storage_path=self.storage_path
         )
 
-        engine = AsyncLLMEngine.from_engine_args(engine_args)
-
-        # Step 4: Inject pre-loaded weights into vLLM model
-        logger.info("💉 Injecting pre-loaded weights into vLLM model...")
-        self._inject_weights_into_vllm(engine, self.weight_bridge)
-
         phase_time = time.time() - phase_start
+
+        # Extract loaded state from weight bridge
+        loaded_state = weight_bridge.loaded_state
+
         logger.info("")
-        logger.info(f"✅ vLLM engine initialized in {phase_time:.1f}s")
-        logger.info(f"   Memory coordination: Expert cache {self.memory_coordinator.expert_cache_budget / 1e9:.2f}GB, "
-                    f"KV cache {self.memory_coordinator.kv_cache_budget / 1e9:.2f}GB")
-        logger.info(f"   Weight bridge: {len(loaded_state.shared_weights)} shared weights, "
-                    f"{loaded_state.model_info.num_layers * loaded_state.model_info.num_experts if loaded_state.model_info.is_moe else 0} experts")
+        logger.info("="*70)
+        logger.info(f"✅ OOM-safe initialization complete in {phase_time:.1f}s")
+        logger.info("="*70)
+        logger.info(f"   Model: {loaded_state.model_info.model_id}")
+        logger.info(f"   Type: {'MoE' if loaded_state.model_info.is_moe else 'Dense'}")
 
-        return engine
+        if loaded_state.model_info.is_moe:
+            logger.info(f"   Layers: {loaded_state.model_info.num_layers}")
+            logger.info(f"   Experts: {loaded_state.model_info.num_experts}")
+            logger.info(f"   Hot experts (GPU): {memory_allocation.gpu_hot_experts}")
+            logger.info(f"   Warm experts (CPU): {memory_allocation.cpu_warm_experts}")
+            logger.info(f"   Cold experts (Storage): {memory_allocation.ssd_cold_experts}")
 
-    def _inject_weights_into_vllm(self, engine: AsyncLLMEngine, weight_bridge: 'SparseMoEWeightBridge'):
-        """Inject pre-loaded weights from LoadedWeightState into vLLM model.
+        logger.info(f"   vLLM gpu_memory_utilization: {memory_allocation.vllm_gpu_memory_utilization:.3f}")
+        logger.info(f"   GPU utilization: {memory_allocation.gpu_total_used / 1024**3:.2f}GB")
 
-        This replaces vLLM's default weight loading with our pre-loaded weights,
-        eliminating duplicate loading.
-
-        Args:
-            engine: vLLM AsyncLLMEngine instance
-            weight_bridge: Bridge to LoadedWeightState
-        """
-        try:
-            # Access vLLM's internal model
-            model = engine.engine.model_executor.driver_worker.model_runner.model
-
-            # Replace all parameters with pre-loaded weights
-            injection_count = 0
-            for name, param in model.named_parameters():
-                try:
-                    # Get weight from bridge (handles both shared and expert weights)
-                    weight_tensor = weight_bridge.get_weight(name)
-
-                    # Replace parameter data (zero-copy if already on GPU)
-                    param.data = weight_tensor
-                    injection_count += 1
-
-                except KeyError as e:
-                    # Some parameters might not be in LoadedWeightState (e.g., buffers)
-                    logger.debug(f"Skipping weight not in bridge: {name}")
-                    continue
-
-            logger.info(f"   ✓ Injected {injection_count} weight tensors from LoadedWeightState")
-
-        except Exception as e:
-            logger.warning(f"   ⚠ Weight injection failed: {e}")
-            logger.warning("   Continuing with vLLM's default loading (may cause conflicts)")
+        return vllm_engine, weight_bridge, memory_allocation, loaded_state
 
     async def startup(self):
-        """Server startup: load weights and initialize vLLM."""
+        """Server startup: OOM-safe initialization with memory coordination."""
         startup_start = time.time()
 
         logger.info("")
-        logger.info("🚀 Starting Unified SparseLLM Production Server")
+        logger.info("🚀 Starting Unified SparseLLM Production Server (OOM-Safe Mode)")
         logger.info(f"   Model: {self.model}")
         logger.info(f"   Host: {self.host}:{self.port}")
+        logger.info(f"   Max model length: {self.max_model_len or 'auto'}")
         logger.info("")
 
-        # Phase 1: Resource-aware weight loading
-        self.loaded_state = self.load_weights_resource_aware()
-
-        # Phase 2: vLLM engine initialization
-        self.vllm_engine = await self.initialize_vllm_engine(self.loaded_state)
+        # NEW: Single-phase OOM-safe initialization
+        self.vllm_engine, self.weight_bridge, self.allocation, self.loaded_state = \
+            await self.initialize_vllm_with_coordination_method()
 
         self.startup_time = time.time() - startup_start
 
         logger.info("")
         logger.info("="*70)
-        logger.info("✅ SERVER READY")
+        logger.info("✅ SERVER READY (OOM-Safe)")
         logger.info("="*70)
         logger.info(f"   Total startup time: {self.startup_time:.1f}s")
+        logger.info(f"   Memory coordination: ACTIVE")
         logger.info(f"   Endpoints:")
         logger.info(f"      POST http://{self.host}:{self.port}/v1/chat/completions")
         logger.info(f"      POST http://{self.host}:{self.port}/v1/completions")
@@ -510,6 +432,17 @@ curl http://{self.host}:{self.port}/v1/chat/completions \\
                         "gpu_utilization_pct": self.loaded_state.placement_plan.gpu_utilization_pct,
                         "cpu_utilization_pct": self.loaded_state.placement_plan.cpu_utilization_pct,
                     }
+                }
+
+            # Add memory allocation info if available
+            if self.allocation:
+                metrics["memory_allocation"] = {
+                    "vllm_gpu_memory_utilization": self.allocation.vllm_gpu_memory_utilization,
+                    "gpu_total_used_gb": self.allocation.gpu_total_used / 1024**3,
+                    "gpu_hot_experts": self.allocation.gpu_hot_experts,
+                    "cpu_warm_experts": self.allocation.cpu_warm_experts,
+                    "ssd_cold_experts": self.allocation.ssd_cold_experts,
+                    "can_fulfill": self.allocation.can_fulfill,
                 }
 
         return metrics
