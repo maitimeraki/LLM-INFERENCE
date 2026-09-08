@@ -1,43 +1,28 @@
 #!/usr/bin/env python3
-"""Unified Production Server: Conflict-Free vLLM Integration
+"""SparseLLM Production Server: Pure PyTorch MoE Inference
 
-This server integrates SparseLLM's resource-aware 4-phase loading with vLLM's
-high-performance serving infrastructure without conflicts.
-
-KEY INTEGRATION POINTS:
-
-1. UnifiedMemoryCoordinator: Splits GPU memory (40% expert cache, 50% KV cache)
-   to prevent OOM conflicts between systems.
-
-2. SparseMoEWeightBridge: Makes vLLM use pre-loaded weights from LoadedWeightState
-   instead of loading from scratch (eliminates duplicate loading).
-
-3. Weight Injection: Replaces vLLM's model parameters with pre-loaded weights
-   during engine initialization (single source of truth for weights).
+This server provides resource-aware 4-phase loading for MoE models using pure PyTorch.
 
 ARCHITECTURE:
 
-Phase 1: Resource-Aware Loading
-  FourPhaseOrchestrator loads weights across GPU/CPU/Storage tiers
+Phase 1: Resource Profiling
+  Profile GPU/CPU/Storage resources
+
+Phase 2: Placement Strategy
+  Calculate optimal expert placement across tiers
+
+Phase 3: Weight Loading
+  Load weights across GPU/CPU/Storage tiers
   Creates LoadedWeightState with shared_weights and expert_cache
 
-Phase 2: vLLM Integration
-  UnifiedMemoryCoordinator establishes memory budgets
-  SparseMoEWeightBridge connects vLLM to LoadedWeightState
-  AsyncLLMEngine initialized with coordinated config
-  Weights injected from LoadedWeightState (no duplicate loading)
-
-Phase 3: Serving
+Phase 4: Serving
   OpenAI-compatible API endpoints
-  Request batching with vLLM scheduler
-  Persistent weights across requests
+  Custom PyTorch-based inference
 
 USAGE:
 
     python serve.py --model mistralai/Mixtral-8x7B-Instruct-v0.1
     python serve.py --model meta-llama/Llama-3.1-8B --port 8080
-
-See docs/VLLM_INTEGRATION.md for complete documentation.
 """
 
 from __future__ import annotations
@@ -58,17 +43,10 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN", "")
+os.environ["VLLM_WSL2_ENABLE_PIN_MEMORY"] = "1"
 
-# Check vLLM availability
-try:
-    from vllm import AsyncEngineArgs, AsyncLLMEngine
-    from vllm.sampling_params import SamplingParams
-    from vllm.utils import random_uuid
-    VLLM_AVAILABLE = True
-except ImportError:
-    VLLM_AVAILABLE = False
-    print("ERROR: vLLM not installed. Install with: pip install vllm")
-    sys.exit(1)
+# Note: Pure PyTorch inference implementation
+# No external inference framework dependencies required
 
 # FastAPI imports
 try:
@@ -83,7 +61,6 @@ except ImportError:
 
 # SparseLLM imports
 from sparse_llm.loading import FourPhaseOrchestrator, LoadedWeightState
-from sparse_llm.integrations.vllm_bridge import initialize_vllm_with_coordination
 
 
 # Configure logging
@@ -95,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 
 class UnifiedServer:
-    """Unified server combining resource-aware loading with vLLM serving."""
+    """Unified server combining resource-aware loading with PyTorch inference."""
 
     def __init__(
         self,
@@ -128,46 +105,40 @@ class UnifiedServer:
 
         # Runtime state
         self.loaded_state: LoadedWeightState | None = None
-        self.vllm_engine: AsyncLLMEngine | None = None
-        self.weight_bridge = None
-        self.allocation = None  # NEW: Memory allocation info
+        self.orchestrator: FourPhaseOrchestrator | None = None
         self.startup_time: float = 0.0
         self.request_count: int = 0
 
-    async def initialize_vllm_with_coordination_method(self):
-        """Initialize vLLM using OOM-safe coordination (NEW METHOD).
-
-        This replaces the old two-phase approach with a single coordinated initialization
-        that prevents OOM by pre-calculating memory allocation.
+    async def initialize_model(self):
+        """Initialize model using 4-phase orchestrator.
 
         Returns:
-            Tuple of (vllm_engine, weight_bridge, memory_allocation, loaded_state)
+            LoadedWeightState with model loaded across GPU/CPU/Storage tiers
         """
         logger.info("="*70)
-        logger.info("🚀 OOM-SAFE INITIALIZATION (Memory-Coordinated)")
+        logger.info("🚀 4-PHASE INITIALIZATION")
         logger.info("="*70)
 
         phase_start = time.time()
 
-        # Use the new OOM-safe initialization function
-        vllm_engine, weight_bridge, memory_allocation = initialize_vllm_with_coordination(
+        # Initialize orchestrator
+        self.orchestrator = FourPhaseOrchestrator()
+
+        # Execute 4-phase loading
+        def progress_callback(message: str):
+            logger.info(message)
+
+        loaded_state = self.orchestrator.initialize(
             model_id=self.model,
-            user_vllm_params={
-                "max_model_len": self.max_model_len,
-                "tensor_parallel_size": self.tensor_parallel_size,
-                "gpu_memory_utilization": self.gpu_memory_utilization,  # Will be overridden by calculator
-            },
-            storage_path=self.storage_path
+            storage_path=self.storage_path,
+            progress_callback=progress_callback
         )
 
         phase_time = time.time() - phase_start
 
-        # Extract loaded state from weight bridge
-        loaded_state = weight_bridge.loaded_state
-
         logger.info("")
         logger.info("="*70)
-        logger.info(f"✅ OOM-safe initialization complete in {phase_time:.1f}s")
+        logger.info(f"✅ Initialization complete in {phase_time:.1f}s")
         logger.info("="*70)
         logger.info(f"   Model: {loaded_state.model_info.model_id}")
         logger.info(f"   Type: {'MoE' if loaded_state.model_info.is_moe else 'Dense'}")
@@ -175,64 +146,42 @@ class UnifiedServer:
         if loaded_state.model_info.is_moe:
             logger.info(f"   Layers: {loaded_state.model_info.num_layers}")
             logger.info(f"   Experts: {loaded_state.model_info.num_experts}")
-            logger.info(f"   Hot experts (GPU): {memory_allocation.gpu_hot_experts}")
-            logger.info(f"   Warm experts (CPU): {memory_allocation.cpu_warm_experts}")
-            logger.info(f"   Cold experts (Storage): {memory_allocation.ssd_cold_experts}")
+            cache_stats = loaded_state.get_cache_stats()
+            logger.info(f"   Hot experts (GPU): {cache_stats['hot_count']}")
+            logger.info(f"   Warm experts (CPU): {cache_stats['warm_count']}")
+            logger.info(f"   Cold experts (Storage): {cache_stats['cold_count']}")
 
-        logger.info(f"   vLLM gpu_memory_utilization: {memory_allocation.vllm_gpu_memory_utilization:.3f}")
-        logger.info(f"   GPU utilization: {memory_allocation.gpu_total_used / 1024**3:.2f}GB")
-
-        return vllm_engine, weight_bridge, memory_allocation, loaded_state
+        return loaded_state
 
     async def startup(self):
-        """Server startup: OOM-safe initialization with memory coordination."""
+        """Server startup: 4-phase initialization."""
         startup_start = time.time()
 
         logger.info("")
-        logger.info("🚀 Starting Unified SparseLLM Production Server (OOM-Safe Mode)")
+        logger.info("🚀 Starting SparseLLM Production Server (PyTorch)")
         logger.info(f"   Model: {self.model}")
         logger.info(f"   Host: {self.host}:{self.port}")
-        logger.info(f"   Max model length: {self.max_model_len or 'auto'}")
         logger.info("")
 
-        # NEW: Single-phase OOM-safe initialization
-        self.vllm_engine, self.weight_bridge, self.allocation, self.loaded_state = \
-            await self.initialize_vllm_with_coordination_method()
+        # Initialize model using 4-phase orchestrator
+        self.loaded_state = await self.initialize_model()
 
         self.startup_time = time.time() - startup_start
 
         logger.info("")
         logger.info("="*70)
-        logger.info("✅ SERVER READY (OOM-Safe)")
+        logger.info("✅ SERVER READY")
         logger.info("="*70)
         logger.info(f"   Total startup time: {self.startup_time:.1f}s")
-        logger.info(f"   Memory coordination: ACTIVE")
         logger.info(f"   Endpoints:")
-        logger.info(f"      POST http://{self.host}:{self.port}/v1/chat/completions")
-        logger.info(f"      POST http://{self.host}:{self.port}/v1/completions")
         logger.info(f"      GET  http://{self.host}:{self.port}/health")
         logger.info(f"      GET  http://{self.host}:{self.port}/metrics")
         logger.info("")
-        logger.info("Test with curl:")
-        logger.info(f"""
-curl http://{self.host}:{self.port}/v1/chat/completions \\
-  -H "Content-Type: application/json" \\
-  -d '{{
-    "model": "{self.model}",
-    "messages": [{{"role": "user", "content": "Hello!"}}],
-    "max_tokens": 100
-  }}'
-""")
 
     async def shutdown(self):
         """Server shutdown: cleanup resources."""
         logger.info("")
         logger.info("🛑 Shutting down server...")
-
-        if self.vllm_engine:
-            logger.info("   Stopping vLLM engine...")
-            # vLLM cleanup is handled automatically
-
         logger.info(f"   Processed {self.request_count} requests during this session")
         logger.info("✅ Shutdown complete")
 
@@ -434,17 +383,6 @@ curl http://{self.host}:{self.port}/v1/chat/completions \\
                     }
                 }
 
-            # Add memory allocation info if available
-            if self.allocation:
-                metrics["memory_allocation"] = {
-                    "vllm_gpu_memory_utilization": self.allocation.vllm_gpu_memory_utilization,
-                    "gpu_total_used_gb": self.allocation.gpu_total_used / 1024**3,
-                    "gpu_hot_experts": self.allocation.gpu_hot_experts,
-                    "cpu_warm_experts": self.allocation.cpu_warm_experts,
-                    "ssd_cold_experts": self.allocation.ssd_cold_experts,
-                    "can_fulfill": self.allocation.can_fulfill,
-                }
-
         return metrics
 
 
@@ -470,8 +408,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="SparseLLM Unified Server",
-    description="Resource-aware weight loading + vLLM high-performance serving",
+    title="SparseLLM Server",
+    description="Resource-aware weight loading for MoE models",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -482,7 +420,7 @@ async def health_check():
     """Health check endpoint."""
     global server
 
-    if not server or not server.vllm_engine:
+    if not server or not server.loaded_state:
         raise HTTPException(status_code=503, detail="Server not ready")
 
     return {
@@ -505,94 +443,30 @@ async def get_metrics():
 
 @app.post("/v1/completions")
 async def create_completion(request: Request):
-    """OpenAI-compatible completions endpoint."""
+    """OpenAI-compatible completions endpoint (placeholder)."""
     global server
 
-    if not server or not server.vllm_engine:
+    if not server or not server.loaded_state:
         raise HTTPException(status_code=503, detail="Server not ready")
 
-    body = await request.json()
-
-    prompt = body.get("prompt", "")
-    max_tokens = body.get("max_tokens", 100)
-    temperature = body.get("temperature", 0.0)
-    top_p = body.get("top_p", 1.0)
-    stream = body.get("stream", False)
-
-    if not prompt:
-        raise HTTPException(status_code=400, detail="prompt is required")
-
-    try:
-        result = await server.generate_completion(
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stream=stream,
-        )
-
-        if stream:
-            async def stream_response():
-                async for chunk in result:
-                    yield f"data: {json.dumps({'choices': [{'text': chunk}]})}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(stream_response(), media_type="text/event-stream")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Error generating completion: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=501, detail="Inference not yet implemented - pure PyTorch inference coming soon")
 
 
 @app.post("/v1/chat/completions")
 async def create_chat_completion(request: Request):
-    """OpenAI-compatible chat completions endpoint."""
+    """OpenAI-compatible chat completions endpoint (placeholder)."""
     global server
 
-    if not server or not server.vllm_engine:
+    if not server or not server.loaded_state:
         raise HTTPException(status_code=503, detail="Server not ready")
 
-    body = await request.json()
-
-    messages = body.get("messages", [])
-    max_tokens = body.get("max_tokens", 100)
-    temperature = body.get("temperature", 0.0)
-    top_p = body.get("top_p", 1.0)
-    stream = body.get("stream", False)
-
-    if not messages:
-        raise HTTPException(status_code=400, detail="messages is required")
-
-    try:
-        result = await server.generate_chat_completion(
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-            stream=stream,
-        )
-
-        if stream:
-            async def stream_response():
-                async for chunk in result:
-                    yield f"data: {json.dumps({'choices': [{'delta': {'content': chunk}}]})}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(stream_response(), media_type="text/event-stream")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Error generating chat completion: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+    raise HTTPException(status_code=501, detail="Inference not yet implemented - pure PyTorch inference coming soon")
 
 
 def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(
-        description="Unified SparseLLM Production Server: Resource-Aware Loading + vLLM"
+        description="SparseLLM Production Server: Resource-Aware Loading + PyTorch Inference"
     )
 
     # Model arguments
@@ -625,26 +499,6 @@ def main():
         help="Custom storage path for cold experts"
     )
 
-    # vLLM arguments
-    parser.add_argument(
-        "--tensor-parallel-size",
-        type=int,
-        default=1,
-        help="Number of GPUs for tensor parallelism (default: 1)"
-    )
-    parser.add_argument(
-        "--gpu-memory-utilization",
-        type=float,
-        default=0.9,
-        help="GPU memory utilization factor (default: 0.9)"
-    )
-    parser.add_argument(
-        "--max-model-len",
-        type=int,
-        default=None,
-        help="Maximum model sequence length (optional)"
-    )
-
     args = parser.parse_args()
 
     # Create global server instance
@@ -654,9 +508,9 @@ def main():
         host=args.host,
         port=args.port,
         storage_path=args.storage_path,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
+        tensor_parallel_size=1,
+        gpu_memory_utilization=0.9,
+        max_model_len=None,
     )
 
     # Run server

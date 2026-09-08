@@ -21,7 +21,7 @@ from sparse_llm.loading.model_introspector import ModelInfo
 
 class AdaptiveMemoryOrchestrator:
     """
-    Wraps FourPhaseOrchestrator with Phase 0 pre-calculation.
+    Orchestrator with Phase 0 pre-calculation.
 
     Enables dynamic memory allocation based on user request parameters
     (context length, dtype, quantization) rather than fixed placement.
@@ -52,7 +52,7 @@ class AdaptiveMemoryOrchestrator:
 
         Args:
             model_id: Hugging Face model ID or local path
-            user_request: User's vLLM configuration parameters
+            user_request: User's inference configuration parameters
             storage_path: Optional custom storage path for cold experts
             progress_callback: Optional callback for progress updates
 
@@ -97,7 +97,7 @@ class AdaptiveMemoryOrchestrator:
             )
 
         log(f"   ✓ Allocation validated in {phase0_time:.1f}s")
-        log(f"   vLLM GPU utilization: {allocation.vllm_gpu_memory_utilization:.1%}")
+        log(f"   Expert cache GPU utilization: {allocation.expert_cache_gpu_utilization:.1%}")
         log(f"   GPU hot experts: {allocation.gpu_hot_expert_count}")
         log(f"   CPU warm experts: {allocation.cpu_warm_expert_count}")
         log(f"   SSD cold experts: {allocation.ssd_cold_expert_count}")
@@ -175,7 +175,7 @@ class AdaptiveMemoryOrchestrator:
         Create a constrained ResourceBudget that respects the allocation.
 
         This ensures the PlacementStrategyCalculator allocates experts according
-        to the DynamicMemoryBudgetCalculator's plan, which accounts for vLLM KV cache.
+        to the DynamicMemoryBudgetCalculator's plan, which accounts for KV cache.
 
         Args:
             original_budget: Original resource budget from profiler

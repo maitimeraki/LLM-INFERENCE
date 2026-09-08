@@ -1,4 +1,4 @@
-"""Dynamic memory budget calculator for coordinating expert weights and vLLM KV cache."""
+"""Dynamic memory budget calculator for coordinating expert weights and KV cache."""
 
 from __future__ import annotations
 from dataclasses import dataclass
@@ -10,7 +10,7 @@ from sparse_llm.loading.model_introspector import ModelInfo
 
 @dataclass(frozen=True)
 class UserRequest:
-    """User request parameters for vLLM inference configuration."""
+    """User request parameters for inference configuration."""
     max_model_len: int
     dtype: str
     quantization: Optional[str] = None
@@ -25,8 +25,8 @@ class MemoryAllocation:
     can_fulfill: bool
     rejection_reason: Optional[str]
 
-    # vLLM parameter (critical output!)
-    vllm_gpu_memory_utilization: float
+    # Expert cache GPU utilization parameter (critical output!)
+    expert_cache_gpu_utilization: float
 
     # Memory breakdown (bytes)
     gpu_shared_weights: int
@@ -53,7 +53,7 @@ class MemoryAllocation:
 
 
 class DynamicMemoryBudgetCalculator:
-    """Calculate memory allocation between expert weights and vLLM KV cache."""
+    """Calculate memory allocation between expert weights and KV cache."""
 
     # Activation buffer as percentage of model size (empirical)
     ACTIVATION_BUFFER_RATIO = 0.10
@@ -72,10 +72,10 @@ class DynamicMemoryBudgetCalculator:
         Args:
             resource_budget: Available hardware resources (with safety margins applied)
             model_info: Model architecture information
-            user_request: User's vLLM configuration request
+            user_request: User's inference configuration request
 
         Returns:
-            MemoryAllocation with detailed breakdown and vllm_gpu_memory_utilization
+            MemoryAllocation with detailed breakdown and expert_cache_gpu_utilization
         """
         # Get bytes per element based on dtype
         bytes_per_element = self._get_dtype_bytes(user_request.dtype, user_request.quantization)
@@ -101,7 +101,20 @@ class DynamicMemoryBudgetCalculator:
         gpu_kv_cache = kv_cache_bytes
         gpu_activation_buffer = activation_buffer_bytes
 
-        gpu_fixed = gpu_shared_weights + gpu_kv_cache + gpu_activation_buffer
+        # CRITICAL FIX: Add extra buffer for inference engine internal allocations
+        # Inference engines allocate additional memory for:
+        # - Model structure/metadata (~1-2GB for MoE models)
+        # - Attention workspace
+        # - CUDA kernels and buffers
+        # For MoE models, this can be 20-30% overhead due to expert routing structures
+        if model_info.is_moe:
+            # MoE models have significant overhead from expert routing
+            engine_overhead = int(total_gpu_available * 0.30)  # 30% for MoE
+        else:
+            # Dense models have less overhead
+            engine_overhead = int(total_gpu_available * 0.10)  # 10% for dense
+
+        gpu_fixed = gpu_shared_weights + gpu_kv_cache + gpu_activation_buffer + engine_overhead
 
         # Check if fixed components fit on GPU
         if gpu_fixed > total_gpu_available:
@@ -111,9 +124,10 @@ class DynamicMemoryBudgetCalculator:
                     f"Need {gpu_fixed / 1024**3:.2f}GB "
                     f"(shared: {gpu_shared_weights / 1024**3:.2f}GB, "
                     f"KV cache: {gpu_kv_cache / 1024**3:.2f}GB, "
-                    f"activation: {gpu_activation_buffer / 1024**3:.2f}GB), "
+                    f"activation: {gpu_activation_buffer / 1024**3:.2f}GB, "
+                    f"engine overhead: {engine_overhead / 1024**3:.2f}GB), "
                     f"but only {total_gpu_available / 1024**3:.2f}GB available. "
-                    f"Try reducing --max-model-len or use smaller dtype/quantization."
+                    f"Try: --max-model-len {max(512, max_model_len // 2)} or use quantization (--quantization fp8)."
                 ),
                 total_gpu_available=total_gpu_available,
                 total_cpu_available=total_cpu_available,
@@ -171,19 +185,27 @@ class DynamicMemoryBudgetCalculator:
         total_cpu_required = cpu_warm_experts
         total_ssd_required = ssd_cold_experts
 
-        # Calculate vllm_gpu_memory_utilization (CRITICAL OUTPUT)
-        # This tells vLLM what percentage of GPU memory it can use for KV cache
-        # Formula: KV cache bytes / total GPU memory
+        # Calculate expert_cache_gpu_utilization (CRITICAL OUTPUT)
+        # This tells the inference engine what percentage of GPU memory it can use for expert cache
+        # Formula: Expert cache bytes / total GPU memory
         total_gpu_memory = resource_budget.gpus[0].total_bytes if resource_budget.gpus else 1
-        vllm_gpu_memory_utilization = gpu_kv_cache / total_gpu_memory
+        expert_cache_gpu_utilization = gpu_kv_cache / total_gpu_memory
 
-        # Clamp to reasonable range (vLLM expects 0.0 to 1.0)
-        vllm_gpu_memory_utilization = max(0.01, min(0.95, vllm_gpu_memory_utilization))
+        # CRITICAL: Further reduce for safety margin (inference engine's internal calculations)
+        # Inference engines have significant overhead beyond the KV cache, especially for MoE models
+        # where they allocate routing structures and expert metadata
+        if model_info.is_moe:
+            expert_cache_gpu_utilization *= 0.5  # 50% safety reduction for MoE
+        else:
+            expert_cache_gpu_utilization *= 0.8  # 20% safety reduction for dense
+
+        # Clamp to reasonable range (expects 0.0 to 1.0)
+        expert_cache_gpu_utilization = max(0.01, min(0.95, expert_cache_gpu_utilization))
 
         return MemoryAllocation(
             can_fulfill=True,
             rejection_reason=None,
-            vllm_gpu_memory_utilization=vllm_gpu_memory_utilization,
+            expert_cache_gpu_utilization=expert_cache_gpu_utilization,
             gpu_shared_weights=gpu_shared_weights,
             gpu_kv_cache=gpu_kv_cache,
             gpu_activation_buffer=gpu_activation_buffer,
@@ -234,31 +256,24 @@ class DynamicMemoryBudgetCalculator:
     ) -> int:
         """Calculate KV cache size in bytes.
 
-        Formula: 2 (K and V) × num_layers × hidden_size × max_model_len × bytes_per_element
+        Formula: 2 (K and V) × num_layers × num_kv_heads × head_dim × max_model_len × bytes_per_element
         Then divide by tensor_parallel_size for distributed inference.
+
+        Note: We use num_key_value_heads (GQA support) instead of num_attention_heads.
         """
-        # Note: We don't have hidden_size directly in ModelInfo, so we estimate it
-        # from shared_weight_bytes. For now, use a typical value (4096) as placeholder.
-        # In production, this should be extracted from model config.
+        # Calculate head dimension
+        head_dim = model_info.hidden_size // model_info.num_attention_heads
 
-        # Estimate hidden_size from shared weights (rough approximation)
-        # For typical models: embeddings ~= vocab_size * hidden_size * 2 bytes
-        # Assume vocab_size = 32000 (common for LLaMA/Mixtral)
-        TYPICAL_VOCAB_SIZE = 32000
-        estimated_hidden_size = 4096  # Default fallback
+        # Use num_key_value_heads for accurate GQA/MQA support
+        num_kv_heads = model_info.num_key_value_heads
 
-        # Try to back-calculate from shared weights if possible
-        # This is rough but better than nothing
-        if model_info.shared_weight_bytes > 0:
-            # Embeddings are typically the largest component
-            estimated_hidden_size = min(8192, max(2048, int(
-                (model_info.shared_weight_bytes / (TYPICAL_VOCAB_SIZE * 2 * model_info.num_layers)) ** 0.5
-            )))
-
+        # Calculate KV cache size
+        # Each layer stores K and V for all positions
         kv_cache_bytes = (
             2  # K and V
             * model_info.num_layers
-            * estimated_hidden_size
+            * num_kv_heads
+            * head_dim
             * max_model_len
             * bytes_per_element
         )
@@ -333,7 +348,7 @@ class DynamicMemoryBudgetCalculator:
         return MemoryAllocation(
             can_fulfill=False,
             rejection_reason=reason,
-            vllm_gpu_memory_utilization=0.0,
+            expert_cache_gpu_utilization=0.0,
             gpu_shared_weights=0,
             gpu_kv_cache=0,
             gpu_activation_buffer=0,

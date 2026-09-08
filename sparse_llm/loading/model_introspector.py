@@ -16,6 +16,11 @@ class ModelInfo:
     shared_weight_bytes: int
     expert_weight_bytes: int  # Per expert
     total_bytes: int
+    # Added for accurate KV cache calculation
+    hidden_size: int
+    intermediate_size: int
+    num_attention_heads: int
+    num_key_value_heads: int
 
 
 class ModelIntrospector:
@@ -64,6 +69,12 @@ class ModelIntrospector:
             ffn_bytes = self._estimate_dense_ffn_weights(config)
             total_bytes += ffn_bytes * num_layers
 
+        # Extract architecture parameters for KV cache calculation
+        hidden_size = getattr(config, "hidden_size", 4096)
+        intermediate_size = getattr(config, "intermediate_size", hidden_size * 4)
+        num_attention_heads = getattr(config, "num_attention_heads", 32)
+        num_key_value_heads = getattr(config, "num_key_value_heads", num_attention_heads)
+
         return ModelInfo(
             model_id=model_id,
             is_moe=is_moe,
@@ -72,7 +83,11 @@ class ModelIntrospector:
             num_experts_per_tok=num_experts_per_tok,
             shared_weight_bytes=shared_weight_bytes,
             expert_weight_bytes=expert_weight_bytes,
-            total_bytes=total_bytes
+            total_bytes=total_bytes,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads
         )
 
     def _detect_moe(self, config: Any) -> tuple[bool, int, int]:
