@@ -1,3 +1,13 @@
-from sparse_llm.inference.engine import InferenceEngine
+"""Inference components for SparseLLM."""
 
-__all__ = ["InferenceEngine"]
+from sparse_llm.inference.moe_inference_engine import (
+    CustomMoEInferenceEngine,
+    InferenceConfig,
+    GenerationStats,
+)
+
+__all__ = [
+    "CustomMoEInferenceEngine",
+    "InferenceConfig",
+    "GenerationStats",
+]
