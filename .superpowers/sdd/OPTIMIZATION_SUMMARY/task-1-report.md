@@ -123,21 +123,14 @@ Old test built its own `visited` list inside its own
 `for layer_idx in range(num_layers)` loop and then asserted that same loop had
 visited every layer. True by construction — it pinned only a signature.
 
-New test `test_engine_decode_loop_visits_all_layers_source_check` does NOT
-pretend to observe the engine at runtime (the full engine cannot be constructed
-here: tokenizer download + weight introspection + memory allocation). It is
-split honestly:
-- signature check: `AttentionEngine.decode` must accept `layer_idx` and
-  `kv_cache`;
-- source-level behavioral check: `_decode_phase` must iterate `num_layers`, and
-  `_decode_phase_streaming` must not contain `layer_id = 0`.
-
-The test name and docstring now state this split explicitly. The old
+New test `test_engine_decode_loop_enters_every_layer` drives the real
+`_decode_phase` with a layer spy and asserts the engine entered every
+`layer_idx` in `range(num_layers)`. It fails today because `_decode_phase`
+passes `None` as the layer index, so the spy records `{None}`. The old
 self-satisfying loop is gone.
 
-The previous source-level companion `test_streaming_decode_does_not_pin_layer_zero`
-was folded into this single honest test to avoid two tests asserting the same
-source fact.
+`test_streaming_decode_does_not_pin_layer_zero` remains a separate source-level
+check; it was not folded into the test above. Both tests exist.
 
 ## 2. IMPORTANT — API names aligned to R7
 
@@ -236,3 +229,126 @@ correct root cause rather than a tautology or a cryptic second import error.
 - No file under `sparse_llm/inference/` or `sparse_llm/loading/` touched.
 - R4 intact (`ExpertProcessor.process_single`/`process_batch` unchanged).
 - CPU only, float32, no network, no new dependencies.
+
+---
+
+# Fix Round 2
+
+Two mechanical items from the scoped re-review.
+
+## 1. Missing trailing newline (fixed)
+
+`sparse_llm/tests/inference/test_forward_pass_contract.py` ended with `)` as its
+final byte and no trailing newline. Exactly one `\n` was appended. No other edit
+to the file.
+
+## 2. Stale test names / folding claim in the report (fixed)
+
+In the `# Fix Round 1` section:
+- Every mention of `test_engine_decode_loop_visits_all_layers_source_check` was
+  replaced with the real name `test_engine_decode_loop_enters_every_layer`.
+- The claim that `test_streaming_decode_does_not_pin_layer_zero` "was folded into
+  this single honest test" was deleted. That test was not folded; it is still
+  present and separate (line 155). The section now states both tests exist.
+- The method description now says what the committed test actually does:
+  `test_engine_decode_loop_enters_every_layer` drives the real `_decode_phase`
+  with a layer spy and asserts the engine entered every `layer_idx` (it fails
+  today because `_decode_phase` passes `None` as the layer index);
+  `test_streaming_decode_does_not_pin_layer_zero` remains a separate source-level
+  check.
+
+No other section was touched. The recorded Fix Round 1 test output was left as-is.
+
+## Verification
+
+Command 1:
+```
+cd /c/Users/Anupam/Desktop/LLM/LOCAL-INFERENCE && python -m pytest sparse_llm/tests/inference/test_forward_pass_contract.py -q --tb=line
+```
+
+Output 1 (exact):
+```
+C:\Users\Anupam\AppData\Roaming\Python\Python313\site-packages\requests\__init__.py:113: RequestsDependencyWarning: urllib3 (2.5.0) or chardet (6.0.0.post1)/charset_normalizer (3.4.4) doesn't match a supported version!
+  warnings.warn(
+FFFFFFF                                                                  [100%]
+================================== FAILURES ===================================
+E   AssertionError: engine decode passed layers ['None'], expected all 3 layers
+    assert {None} == {0, 1, 2}
+      
+      Extra items in the left set:
+      None
+      Extra items in the right set:
+      0
+      1
+      2
+      Use -v to get more diff
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:149: AssertionError: engine decode passed layers ['None'], expected all 3 layers
+E   AssertionError: streaming decode hardcodes `layer_id = 0`; it must run every layer.
+    assert 'layer_id = 0' not in '    def _de...ken_hidden\n'
+      
+      'layer_id = 0' is contained here:
+                  layer_id = 0
+                    current_hidden = self.expert_processor.process_single(
+                        hidden_state=current_hidden,
+                        expert_indices=expert_indices.squeeze(1),
+                        expert_weights=expert_weights.squeeze(1),...
+      
+      ...Full output truncated (24 lines hidden), use '-vv' to show
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:160: AssertionError: streaming decode hardcodes `layer_id = 0`; it must run every layer.
+E   AttributeError: 'AttentionEngine' object has no attribute 'load_layer_weights'
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:190: AttributeError: 'AttentionEngine' object has no attribute 'load_layer_weights'
+E   ImportError: cannot import name 'RMSNorm' from 'sparse_llm.inference.attention_engine' (C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\inference\attention_engine.py)
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:208: ImportError: cannot import name 'RMSNorm' from 'sparse_llm.inference.attention_engine' (C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\inference\attention_engine.py)
+E   AssertionError: engine must expose `_apply_attention_layer(h, layer_idx, kv_cache)` that adds the attention output as a residual (h + sublayer(h)); current code replaces the hidden state.
+    assert False
+     +  where False = hasattr(<class 'sparse_llm.inference.moe_inference_engine.CustomMoEInferenceEngine'>, '_apply_attention_layer')
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:252: AssertionError: engine must expose `_apply_attention_layer(h, layer_idx, kv_cache)` that adds the attention output as a residual (h + sublayer(h)); current code replaces the hidden state.
+E   AssertionError: KV cache seq_len is 14, expected 8 (5 prefill + 3 decode tokens). The position must advance once per token, not once per layer.
+    assert 14 == (5 + 3)
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:306: AssertionError: KV cache seq_len is 14, expected 8 (5 prefill + 3 decode tokens). The position must advance once per token, not once per layer.
+E   AssertionError: AttentionEngine.prefill must accept a layer_idx argument (the layer loop belongs to the engine); got params ['self', 'input_ids', 'attention_mask']
+    assert 'layer_idx' in mappingproxy(OrderedDict({'self': <Parameter "self">, 'input_ids': <Parameter "input_ids: torch.Tensor">, 'attention_mask': <Parameter "attention_mask: Optional[torch.Tensor] = None">}))
+C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\tests\inference\test_forward_pass_contract.py:322: AssertionError: AttentionEngine.prefill must accept a layer_idx argument (the layer loop belongs to the engine); got params ['self', 'input_ids', 'attention_mask']
+============================== warnings summary ===============================
+sparse_llm/tests/inference/test_forward_pass_contract.py::test_kv_cache_position_advances_once_per_token
+  C:\Users\Anupam\AppData\Roaming\Python\Python313\site-packages\_pytest\unraisableexception.py:67: PytestUnraisableExceptionWarning: Exception ignored in: <function CustomMoEInferenceEngine.__del__ at 0x00000205D0E051C0>
+  
+  Traceback (most recent call last):
+    File "C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\inference\moe_inference_engine.py", line 1219, in __del__
+      self._cleanup()
+      ~~~~~~~~~~~~~^^
+    File "C:\Users\Anupam\Desktop\LLM\LOCAL-INFERENCE\sparse_llm\inference\moe_inference_engine.py", line 1206, in _cleanup
+      self.attention_engine.clear_cache()
+      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  AttributeError: '_LayerSpy' object has no attribute 'clear_cache'
+  
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+    warnings.warn(pytest.PytestUnraisableExceptionWarning(msg))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_engine_decode_loop_enters_every_layer
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_streaming_decode_does_not_pin_layer_zero
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_attention_uses_learned_projections
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_rmsnorm_normalizes
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_residual_algebra_zeroed_sublayer_is_identity
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_kv_cache_position_advances_once_per_token
+FAILED sparse_llm/tests/inference/test_forward_pass_contract.py::test_layer_loop_lives_in_exactly_one_place
+7 failed, 1 warning in 1.90s
+```
+
+Still 7 failed — all six defects pinned. Count matches expectation.
+
+Command 2:
+```
+tail -c 3 sparse_llm/tests/inference/test_forward_pass_contract.py | od -c
+```
+
+Output 2 (exact):
+```
+0000000       )  \n
+0000003
+```
+
+Last byte is now `\n`.
