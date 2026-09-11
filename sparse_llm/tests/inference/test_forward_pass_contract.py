@@ -4,21 +4,29 @@ Encodes the six invariants from
 `.superpowers/sdd/OPTIMIZATION_SUMMARY/task-1-brief.md`. Every test is expected
 to FAIL on the current (pre-fix) code and PASS after Tasks 2/3.
 
-The full `CustomMoEInferenceEngine` is deliberately never constructed here: its
-`__init__` downloads a tokenizer, introspects a model, and allocates real
-memory. Where a defect lives in the engine's orchestration loop we assert on
-the post-fix interface / on the per-layer units instead (see the task report
-for which assertion uses which strategy).
+The full `CustomMoEInferenceEngine` is never constructed via `__init__` (it
+downloads a tokenizer, introspects a model, and allocates real memory). Where a
+defect lives in the engine's orchestration loop, the bare engine is built with
+`object.__new__` and its collaborators stubbed, then the real engine loop is
+driven and observed.
+
+API names pinned by Ruling R7 (harness and Task 2 must not drift):
+    AttentionEngine.load_layer_weights(shared_weights, layer_id)
+    AttentionEngine.prefill(input_ids, layer_idx, kv_cache)
+    AttentionEngine.decode(token_id, layer_idx, kv_cache)
+    CustomMoEInferenceEngine._apply_attention_layer(h, layer_idx, kv_cache)
+        -> (h, kv_cache)
+    RMSNorm lives in sparse_llm/inference/attention_engine.py, .weight [hidden]
 
 Fixed synthetic configuration (verbatim from the brief):
     num_layers = 3, num_experts = 4, top_k = 2, hidden_size = 64,
-    num_attention_heads = 4 (head_dim = 16), intermediate_size = 128,
-    max_seq_len = 32, device = cpu, dtype = float32.
+    num_attention_heads = 4 (head_dim = 16), max_seq_len = 32,
+    device = cpu, dtype = float32.
 """
 
 import inspect
+from types import SimpleNamespace
 
-import pytest
 import torch
 
 from sparse_llm.inference.attention_engine import AttentionEngine
@@ -30,10 +38,14 @@ TOP_K = 2
 HIDDEN_SIZE = 64
 NUM_HEADS = 4
 HEAD_DIM = 16
-INTERMEDIATE_SIZE = 128
 MAX_SEQ_LEN = 32
 DEVICE = "cpu"
 DTYPE = torch.float32
+
+# INTERMEDIATE_SIZE (128) is intentionally omitted: no expert FFN is exercised
+# by these contract tests, and a dead constant reads as an unused fixture.
+
+assert TOP_K <= NUM_EXPERTS, "synthetic config: top_k must not exceed num_experts"
 
 torch.manual_seed(0)
 
@@ -54,35 +66,89 @@ def _rms(x):
 
 
 # ---------------------------------------------------------------------------
+# Bare-engine harness: drives the real orchestration loop with stubbed units.
+# ---------------------------------------------------------------------------
+class _FixedRouter:
+    """Returns valid top-k routing; never touches real weights."""
+
+    router_weights = None
+
+    def forward(self, hidden_states, batch_mode=True):
+        batch = hidden_states.shape[0]
+        indices = torch.arange(TOP_K).view(1, 1, TOP_K).expand(batch, 1, TOP_K).clone()
+        weights = torch.ones(batch, 1, TOP_K, dtype=torch.float32)
+        return indices, weights
+
+
+class _PassthroughExperts:
+    def process_single(self, hidden_state, **kwargs):
+        return hidden_state
+
+
+def _make_bare_engine(attention_engine):
+    from sparse_llm.inference.moe_inference_engine import CustomMoEInferenceEngine
+
+    engine = object.__new__(CustomMoEInferenceEngine)
+    engine.model_info = SimpleNamespace(num_layers=NUM_LAYERS)
+    engine.attention_engine = attention_engine
+    engine.router_calculator = _FixedRouter()
+    engine.expert_processor = _PassthroughExperts()
+    engine.tokenizer = SimpleNamespace(eos_token_id=999)
+    engine._sample_next_token = lambda *a, **k: torch.tensor([0])
+    engine._embed_tokens = lambda *a, **k: torch.zeros(1, 1, HIDDEN_SIZE)
+    engine._create_expert_loader = lambda layer_id: (lambda expert_id: None)
+    return engine
+
+
+def _make_state(kv_cache):
+    return SimpleNamespace(
+        hidden_states=torch.zeros(1, 1, HIDDEN_SIZE),
+        kv_cache=kv_cache,
+        token_times=[],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Assertion 1 - all layers visited
 # ---------------------------------------------------------------------------
-def test_all_layers_visited_in_decode():
-    """Assertion 1: one decode step must enter every layer.
+class _LayerSpy:
+    """Records the layer_idx the engine passes to `decode` on every call."""
 
-    Defect: `_decode_phase_streaming` pins `layer_id = 0`, so the streaming
-    path only ever visits layer 0. Strategy: drive the per-layer unit in a
-    loop (the engine's loop after Task 2) and assert every layer is entered;
-    also assert the streaming path no longer hardcodes layer 0.
+    def __init__(self):
+        self.visited = []
+
+    def decode(self, *args, **kwargs):
+        if "layer_idx" in kwargs:
+            layer_idx = kwargs["layer_idx"]
+        elif len(args) >= 2:
+            layer_idx = args[1]
+        else:
+            layer_idx = None
+        self.visited.append(layer_idx)
+        token = args[0] if args else kwargs.get("token_id")
+        cache = kwargs.get("kv_cache")
+        if cache is None and len(args) >= 3:
+            cache = args[2]
+        return token, cache
+
+
+def test_engine_decode_loop_enters_every_layer():
+    """Assertion 1: the engine's per-token decode loop must enter every layer.
+
+    Drives the real `_decode_phase` with a spy attention sublayer and asserts
+    the engine passed every `layer_idx` in `range(num_layers)` to `decode`.
+    Current code calls `decode` without a `layer_idx` at all, so the spy sees
+    `{None}` and the test fails for the real reason (not by construction).
     """
-    engine = _make_attention_engine()
-    _, cache = engine.prefill(torch.randn(1, 4, engine.hidden_dim))
+    spy = _LayerSpy()
+    engine = _make_bare_engine(spy)
+    state = _make_state({})
 
-    visited = []
-    real_decode = engine.decode
+    engine._decode_phase(state, max_tokens=1, temperature=1.0, top_p=1.0, top_k=1)
 
-    def spy(token, kv, layer_idx=None, **kwargs):
-        visited.append(layer_idx)
-        return real_decode(token, kv, layer_idx=layer_idx, **kwargs)
-
-    engine.decode = spy
-
-    hidden = torch.randn(1, 1, engine.hidden_dim)
-    for layer_idx in range(engine.num_layers):
-        hidden, cache = engine.decode(hidden, cache, layer_idx=layer_idx)
-
-    assert set(visited) == set(range(engine.num_layers)), (
-        f"decode visited layers {sorted(set(visited))}, expected all "
-        f"{engine.num_layers} layers"
+    assert set(spy.visited) == set(range(NUM_LAYERS)), (
+        f"engine decode passed layers {sorted(map(str, set(spy.visited)))}, "
+        f"expected all {NUM_LAYERS} layers"
     )
 
 
@@ -99,39 +165,38 @@ def test_streaming_decode_does_not_pin_layer_zero():
 # ---------------------------------------------------------------------------
 # Assertion 2 - attention uses learned projections
 # ---------------------------------------------------------------------------
-def _projection_checkpoint(scale_q):
-    """Checkpoint-style weights with distinct attention projections per layer."""
-    eye = torch.eye(HIDDEN_SIZE)
+def _checkpoint(q_scale, k_scale, v_scale, o_scale):
+    """Checkpoint-style weights with distinct projections on every path."""
     weights = {}
     for layer in range(NUM_LAYERS):
         prefix = f"model.layers.{layer}.self_attn"
-        weights[f"{prefix}.q_proj.weight"] = eye * scale_q
-        weights[f"{prefix}.k_proj.weight"] = eye
-        weights[f"{prefix}.v_proj.weight"] = eye
-        weights[f"{prefix}.o_proj.weight"] = eye
+        weights[f"{prefix}.q_proj.weight"] = torch.eye(HIDDEN_SIZE) * q_scale
+        weights[f"{prefix}.k_proj.weight"] = torch.eye(HIDDEN_SIZE) * k_scale
+        weights[f"{prefix}.v_proj.weight"] = torch.eye(HIDDEN_SIZE) * v_scale
+        weights[f"{prefix}.o_proj.weight"] = torch.eye(HIDDEN_SIZE) * o_scale
     return weights
 
 
 def test_attention_uses_learned_projections():
-    """Assertion 2: differing q_proj weights must change the layer output.
+    """Assertion 2: differing q/k/v/o weights must change the layer output.
 
     Defect: the input is reshaped three times for Q/K/V, so projection weights
-    are invisible. Two engines are given different q_proj weights; their
+    are invisible. Two engines get different q, k, v, AND o weights; their
     outputs must differ by more than 1e-6.
     """
     x = torch.randn(1, 4, HIDDEN_SIZE)
 
     engine_a = _make_attention_engine()
-    engine_a.load_weights_from_checkpoint(_projection_checkpoint(scale_q=0.5))
-    out_a, _ = engine_a.prefill(x.clone())
+    engine_a.load_layer_weights(_checkpoint(0.5, 0.7, 1.3, 0.9), layer_id=0)
+    out_a, _ = engine_a.prefill(input_ids=x.clone(), layer_idx=0, kv_cache=None)
 
     engine_b = _make_attention_engine()
-    engine_b.load_weights_from_checkpoint(_projection_checkpoint(scale_q=2.0))
-    out_b, _ = engine_b.prefill(x.clone())
+    engine_b.load_layer_weights(_checkpoint(2.0, 1.1, 0.6, 1.4), layer_id=0)
+    out_b, _ = engine_b.prefill(input_ids=x.clone(), layer_idx=0, kv_cache=None)
 
     assert torch.max(torch.abs(out_a - out_b)).item() > 1e-6, (
-        "Changing q_proj weights did not change the attention output - the "
-        "engine is not using learned Q/K/V/O projections."
+        "Changing attention projection weights did not change the attention "
+        "output - the engine is not using learned Q/K/V/O projections."
     )
 
 
@@ -140,10 +205,7 @@ def test_attention_uses_learned_projections():
 # ---------------------------------------------------------------------------
 def test_rmsnorm_normalizes():
     """Assertion 3: RMSNorm output has unit RMS; per-channel weight scales it."""
-    try:
-        from sparse_llm.inference.attention_engine import RMSNorm
-    except ImportError:
-        from sparse_llm.inference.moe_inference_engine import RMSNorm
+    from sparse_llm.inference.attention_engine import RMSNorm
 
     x = torch.randn(2, 8, HIDDEN_SIZE) * 3.0 + 1.5
     norm = RMSNorm(HIDDEN_SIZE)
@@ -167,31 +229,33 @@ def test_rmsnorm_normalizes():
 # ---------------------------------------------------------------------------
 # Assertion 4 - residual algebra
 # ---------------------------------------------------------------------------
+class _ZeroAttention:
+    """Attention sublayer that emits zeros, keeping the residual observable."""
+
+    def decode(self, *args, **kwargs):
+        token = args[0] if args else kwargs.get("token_id")
+        cache = kwargs.get("kv_cache")
+        if cache is None and len(args) >= 3:
+            cache = args[2]
+        return torch.zeros_like(token), cache
+
+
 def test_residual_algebra_zeroed_sublayer_is_identity():
     """Assertion 4: block output == input when the sublayer output is zeroed.
 
     Defect: the engine replaces the hidden state instead of adding
-    (`h + 0 != h`). Strategy: exercise the per-layer attention block on a bare
-    instance (no `__init__`) with a zero-output attention sublayer.
+    (`h + 0 != h`). Uses the R7-pinned block
+    `_apply_attention_layer(h, layer_idx, kv_cache) -> (h, kv_cache)`.
     """
     from sparse_llm.inference.moe_inference_engine import CustomMoEInferenceEngine
 
-    method_name = None
-    for name in ("_apply_attention_layer", "_apply_attention_block", "_attention_block"):
-        if hasattr(CustomMoEInferenceEngine, name):
-            method_name = name
-            break
-    assert method_name is not None, (
-        "engine must expose a per-layer attention block that adds a residual "
-        "(h + sublayer(h)); current code replaces the hidden state."
+    assert hasattr(CustomMoEInferenceEngine, "_apply_attention_layer"), (
+        "engine must expose `_apply_attention_layer(h, layer_idx, kv_cache)` "
+        "that adds the attention output as a residual (h + sublayer(h)); "
+        "current code replaces the hidden state."
     )
 
-    class _ZeroAttention:
-        def decode(self, *args, **kwargs):
-            return torch.zeros(1, 1, HIDDEN_SIZE), kwargs.get("kv_cache")
-
     engine = object.__new__(CustomMoEInferenceEngine)
-    engine.num_layers = NUM_LAYERS
     engine.attention_engine = _ZeroAttention()
     engine.device = torch.device(DEVICE)
     engine.dtype = DTYPE
@@ -205,7 +269,7 @@ def test_residual_algebra_zeroed_sublayer_is_identity():
     }
 
     h = torch.randn(1, 1, HIDDEN_SIZE)
-    out, _ = getattr(engine, method_name)(h, 0, {})
+    out, _ = engine._apply_attention_layer(h, 0, {})
     assert torch.equal(out, h), (
         "With a zeroed attention sublayer the block must return its input "
         "(residual add), but it did not."
@@ -216,21 +280,28 @@ def test_residual_algebra_zeroed_sublayer_is_identity():
 # Assertion 5 - KV cache position advances once per token
 # ---------------------------------------------------------------------------
 def test_kv_cache_position_advances_once_per_token():
-    """Assertion 5: seq_len == P + N after prefill of P and N decode steps.
+    """Assertion 5 contract: `AttentionEngine.decode` writes K/V at
+    `current_pos` and does NOT advance `kv_cache['seq_len']`; the engine
+    advances `seq_len` exactly once per generated token, after its layer loop.
 
-    Defect: the engine's per-layer loop calls decode once per layer, and decode
-    advances seq_len on every call, so the position advances once per inner
-    layer instead of once per token.
+    Defect pinned: current `decode` increments `seq_len` on every per-layer
+    call, so one token traversing `num_layers` layers advances the position
+    `num_layers` times instead of once.
     """
-    engine = _make_attention_engine()
-    prompt_len = 5
-    _, cache = engine.prefill(torch.randn(1, prompt_len, engine.hidden_dim))
+    engine = _make_bare_engine(_make_attention_engine())
+    prompt_len, decode_steps = 5, 3
 
-    decode_steps = 3
-    hidden = torch.randn(1, 1, engine.hidden_dim)
-    for _ in range(decode_steps):
-        for layer_idx in range(engine.num_layers):
-            hidden, cache = engine.decode(hidden, cache, layer_idx=layer_idx)
+    # Post-prefill cache state: P tokens already written, position == P.
+    cache = {
+        "keys": torch.zeros(1, NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM),
+        "values": torch.zeros(1, NUM_LAYERS, MAX_SEQ_LEN, NUM_HEADS, HEAD_DIM),
+        "seq_len": prompt_len,
+    }
+    state = _make_state(cache)
+
+    engine._decode_phase(
+        state, max_tokens=decode_steps, temperature=1.0, top_p=1.0, top_k=1
+    )
 
     assert cache["seq_len"] == prompt_len + decode_steps, (
         f"KV cache seq_len is {cache['seq_len']}, expected "
@@ -252,8 +323,14 @@ def test_layer_loop_lives_in_exactly_one_place():
             f"AttentionEngine.{name} must accept a layer_idx argument (the "
             f"layer loop belongs to the engine); got params {list(params)}"
         )
+        assert "kv_cache" in params, (
+            f"AttentionEngine.{name} must accept a kv_cache argument; "
+            f"got params {list(params)}"
+        )
 
-    src = inspect.getsource(AttentionEngine.prefill) + inspect.getsource(AttentionEngine.decode)
+    src = inspect.getsource(AttentionEngine.prefill) + inspect.getsource(
+        AttentionEngine.decode
+    )
     assert "range(self.num_layers)" not in src, (
         "AttentionEngine.prefill/decode must not iterate range(self.num_layers); "
         "the layer loop must live in exactly one place (the engine)."
