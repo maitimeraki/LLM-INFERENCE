@@ -28,7 +28,6 @@ from sparse_llm.inference.router_calculator import RouterCalculator
 from sparse_llm.inference.expert_processor import ExpertProcessor, ExpertFFN
 from sparse_llm.inference.attention_engine import AttentionEngine, RMSNorm
 from sparse_llm.inference.expert_cache_manager import ExpertCacheManager
-from sparse_llm.cache.expert_cache import ExpertCache
 try:
     from sparse_llm.core.router_predictor import RouterPredictor
 except ImportError:
@@ -154,6 +153,11 @@ class CustomMoEInferenceEngine:
         self.expert_cache = self._initialize_expert_cache()
         self.cache_manager = self._initialize_cache_manager()
         self.expert_processor = self._initialize_expert_processor()
+
+        # Safetensors key→file index (built once after model path is available)
+        self._safetensors_index: dict[str, tuple[Path, str]] = {}
+        # Module cache: (layer_id, expert_id) → ExpertFFN, built once per (layer, expert)
+        self._expert_module_cache: dict[tuple[int, int], ExpertFFN] = {}
 
         # Load model weights
         self._load_model_weights()
@@ -463,6 +467,10 @@ class CustomMoEInferenceEngine:
         # key-mismatch bug surfaces at load time, not mid-generation.
         self._load_attention_and_norm_weights(shared_weights)
 
+        # Build safetensors key→(file, key) index ONCE so every expert load does a
+        # dict lookup instead of rescanning all files with glob + safe_open.
+        self._build_safetensors_index(model_path)
+
         return shared_weights
 
     def _load_attention_and_norm_weights(self, shared_weights: dict) -> None:
@@ -484,6 +492,19 @@ class CustomMoEInferenceEngine:
             }
 
         self.final_norm = self._load_norm(shared_weights, None, "norm", hidden)
+
+    def _build_safetensors_index(self, model_path: Path) -> None:
+        """Build key→(file, key) index for all safetensors files once at init."""
+        index: dict[str, tuple[Path, str]] = {}
+        files = list(model_path.glob("*.safetensors"))
+        if not files:
+            files = list(model_path.glob("**/*.safetensors"))
+        for st_file in files:
+            with safe_open(st_file, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    index[key] = (st_file, key)
+        self._safetensors_index = index
+        logger.info(f"   Built safetensors index: {len(index)} keys across {len(files)} files")
 
     def _load_norm(self, shared_weights: dict, layer_id, name: str, hidden: int):
         """Build an RMSNorm from checkpoint weights, or None (identity fallback)."""
@@ -630,53 +651,37 @@ class CustomMoEInferenceEngine:
     ) -> dict[str, torch.Tensor]:
         """Load specific expert weights from storage (cold tier).
 
-        Returns a dictionary with normalized keys (w1.weight, w2.weight, w3.weight)
-        that can be loaded into ExpertFFN module.
+        Uses the pre-built safetensors index (self._safetensors_index) for O(1)
+        lookups instead of rescanning all files on every call.
         """
-        from safetensors import safe_open
-
         expert_weights = {}
 
-        # Expert weight patterns (universal across architectures)
-        # Format: model.layers.{layer}.{moe_module}.experts.{expert_id}.{weight_name}
+        # Build candidate key prefixes for this (layer, expert)
+        # (layer-first ordering mirrors _preload_hot_experts)
         patterns = [
-            f"model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.",  # Mixtral
-            f"model.layers.{layer_id}.mlp.experts.{expert_id}.",  # Some architectures
-            f"model.layers.{layer_id}.moe.experts.{expert_id}.",  # Alternative
-            f"model.layers.{layer_id}.feed_forward.experts.{expert_id}."  # Alternative
+            f"model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.",
+            f"model.layers.{layer_id}.mlp.experts.{expert_id}.",
+            f"model.layers.{layer_id}.moe.experts.{expert_id}.",
+            f"model.layers.{layer_id}.feed_forward.experts.{expert_id}.",
         ]
 
-        # Load from safetensors files
-        safetensors_files = list(model_path.glob("*.safetensors"))
-        if not safetensors_files:
-            safetensors_files = list(model_path.glob("**/*.safetensors"))
-
-        raw_weights = {}
-        for st_file in safetensors_files:
-            with safe_open(st_file, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    # Check if matches expert pattern
-                    for pattern in patterns:
-                        if pattern in key:
-                            # Load to CPU, will be moved to device when loaded into expert module
-                            raw_weights[key] = f.get_tensor(key)
+        # Find all matching keys in the index (O(n patterns) per call, not O(files * keys))
+        raw_weights: dict[str, torch.Tensor] = {}
+        for pattern in patterns:
+            for key, (st_file, _canonical) in self._safetensors_index.items():
+                if pattern in key:
+                    with safe_open(st_file, framework="pt", device="cpu") as f:
+                        raw_weights[key] = f.get_tensor(key)
 
         if not raw_weights:
             raise FileNotFoundError(
-                f"No weights found for expert ({layer_id}, {expert_id}) in {model_path}. "
+                f"No weights found for expert ({layer_id}, {expert_id}) in model. "
                 f"This model may not be a supported MoE architecture."
             )
 
-        # Normalize weight keys to standard format (w1, w2, w3)
-        # Different architectures use different naming:
-        # - Mixtral: w1, w2, w3
-        # - Qwen: gate_proj, up_proj, down_proj
-        # - DeepSeek: gate_proj, up_proj, down_proj
+        # Normalize to w1/w2/w3
         for key, tensor in raw_weights.items():
-            # Extract the weight name (last part after expert_id)
             weight_name = key.split(f".{expert_id}.")[-1]
-
-            # Normalize to w1/w2/w3 format
             if "w1.weight" in weight_name or "gate_proj.weight" in weight_name:
                 expert_weights["w1.weight"] = tensor
             elif "w2.weight" in weight_name or "down_proj.weight" in weight_name:
@@ -684,10 +689,8 @@ class CustomMoEInferenceEngine:
             elif "w3.weight" in weight_name or "up_proj.weight" in weight_name:
                 expert_weights["w3.weight"] = tensor
             else:
-                # Keep other weights as-is (biases, etc.)
                 expert_weights[weight_name] = tensor
 
-        # Validate we have the required weights
         required_keys = {"w1.weight", "w2.weight"}
         if not required_keys.issubset(expert_weights.keys()):
             raise ValueError(
@@ -698,22 +701,52 @@ class CustomMoEInferenceEngine:
         return expert_weights
 
     def _preload_hot_experts(self, model_path: Path) -> None:
-        """Preload hot experts to GPU cache."""
+        """Preload hot experts: build ExpertFFN modules and populate the module cache.
+
+        Chosen: layer-first ordering (layer 0 first, then layer 1, ...).
+        This fills the module cache so _create_expert_loader hits it on the
+        first expert access instead of going to disk. GPU tensors are placed
+        in the three-tier cache via preload_gpu so the loader's
+        expert_cache.get() call promotes them to the GPU tier.
+        """
         hot_count = self.memory_allocation.gpu_hot_expert_count
         total_experts = self.model_info.num_layers * self.model_info.num_experts
-
-        experts_loaded = 0
         target = min(hot_count, total_experts)
 
+        experts_loaded = 0
         for layer_id in range(self.model_info.num_layers):
             for expert_id in range(self.model_info.num_experts):
                 if experts_loaded >= target:
                     break
 
-                # Load expert weights from storage
-                expert_weights = self._load_expert_from_storage(model_path, layer_id, expert_id)
+                key = (layer_id, expert_id)
+                if key in self._expert_module_cache:
+                    experts_loaded += 1
+                    continue
 
-                # Preload to GPU cache
+                expert_weights = self._load_expert_from_storage(model_path, layer_id, expert_id)
+                has_gate = "w3.weight" in expert_weights
+
+                expert = ExpertFFN(
+                    hidden_dim=self.model_info.hidden_size,
+                    expert_dim=self.model_info.intermediate_size,
+                    activation="silu",
+                    has_gate=has_gate,
+                )
+                expert.w1.weight.data = expert_weights["w1.weight"].to(
+                    device=self.device, dtype=self.dtype
+                )
+                expert.w2.weight.data = expert_weights["w2.weight"].to(
+                    device=self.device, dtype=self.dtype
+                )
+                if has_gate and expert.w3 is not None:
+                    expert.w3.weight.data = expert_weights["w3.weight"].to(
+                        device=self.device, dtype=self.dtype
+                    )
+                expert.eval()
+
+                self._expert_module_cache[key] = expert
+                # Also populate three-tier cache tensors so get() has GPU tensors
                 self.expert_cache.preload_gpu(layer_id, expert_id, expert_weights)
 
                 experts_loaded += 1
@@ -721,7 +754,7 @@ class CustomMoEInferenceEngine:
             if experts_loaded >= target:
                 break
 
-        logger.info(f"   ✓ Preloaded {experts_loaded}/{target} hot experts to GPU cache")
+        logger.info(f"   ✓ Preloaded {experts_loaded}/{target} hot ExpertFFN modules")
 
     def _is_shared_weight(self, weight_name: str) -> bool:
         """Check if weight is shared (non-expert)."""
@@ -1068,55 +1101,58 @@ class CustomMoEInferenceEngine:
         )
 
     def _create_expert_loader(self, layer_id: int) -> Callable[[int], ExpertFFN]:
-        """Create expert loader function that loads real weights from three-tier cache."""
+        """Create expert loader that checks the module cache before storage.
 
-        # Cache model path to avoid repeated downloads
-        model_path = self._ensure_model_downloaded()
+        Three-tier lookup per request:
+        1. Module cache  → (layer_id, expert_id) → ExpertFFN (built once per key)
+        2. Three-tier cache → expert_cache.get(layer_id, expert_id) -> tensors
+        3. Storage        → _load_expert_from_storage (unavoidable I/O)
+
+        Returns a callable that callers pass to ExpertProcessor._get_expert(),
+        which wraps it via expert_cache.get_or_load().
+        """
 
         def load_expert(expert_id: int) -> ExpertFFN:
-            """Load expert weights through three-tier cache (GPU → CPU → Storage).
+            key = (layer_id, expert_id)
 
-            OPTIMIZED: The ExpertCache checks memory tiers BEFORE loading from storage:
-            1. GPU cache hit → return immediately (no I/O!)
-            2. CPU cache hit → promote to GPU (no disk I/O)
-            3. Storage load → load from disk and cache (unavoidable I/O)
+            # Tier 1: module cache hit
+            if key in self._expert_module_cache:
+                return self._expert_module_cache[key]
 
-            Returns an ExpertFFN module with real weights loaded from checkpoint.
-            """
-            # Load expert weights from storage (cache handles tier management)
-            expert_weights = self._load_expert_from_storage(
-                model_path,
-                layer_id,
-                expert_id
-            )
+            # Tier 2: three-tier cache (GPU → CPU → Storage)
+            try:
+                weights, tier = self.expert_cache.get(layer_id, expert_id)
+                # weights is a dict of tensors already on GPU; build module once
+            except ValueError:
+                # Tier 3: storage miss → load from disk
+                weights = self._load_expert_from_storage(
+                    self._ensure_model_downloaded(),
+                    layer_id,
+                    expert_id,
+                )
+                tier = "storage"
 
-            # Determine if this is a gated expert (has w3)
-            has_gate = "w3.weight" in expert_weights
-
-            # Create expert module
+            has_gate = "w3.weight" in weights
             expert = ExpertFFN(
                 hidden_dim=self.model_info.hidden_size,
                 expert_dim=self.model_info.intermediate_size,
-                activation="silu",  # Most MoE models use SiLU/Swish
-                has_gate=has_gate
+                activation="silu",
+                has_gate=has_gate,
             )
-
-            # Load weights into module
-            # Move to device and dtype
-            expert.w1.weight.data = expert_weights["w1.weight"].to(
+            expert.w1.weight.data = weights["w1.weight"].to(
                 device=self.device, dtype=self.dtype
             )
-            expert.w2.weight.data = expert_weights["w2.weight"].to(
+            expert.w2.weight.data = weights["w2.weight"].to(
                 device=self.device, dtype=self.dtype
             )
             if has_gate and expert.w3 is not None:
-                expert.w3.weight.data = expert_weights["w3.weight"].to(
+                expert.w3.weight.data = weights["w3.weight"].to(
                     device=self.device, dtype=self.dtype
                 )
-
-            # Set to eval mode (no gradient computation needed)
             expert.eval()
 
+            # Cache the built module for future hits within this decode pass
+            self._expert_module_cache[key] = expert
             return expert
 
         return load_expert

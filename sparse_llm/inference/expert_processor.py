@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Optional, List
 
 import torch
@@ -127,7 +128,8 @@ class ExpertProcessor:
                 layer_id=layer_id,
                 pin=True,  # Pin during execution to prevent eviction
             )
-            self.cache_misses += 1
+            # Note: tier-aware hit/miss stats come from ExpertCache.get_stats(),
+            # not from unconditional counter increments here.
         else:
             # Simple cache lookup
             expert = self.expert_cache.get(expert_id, layer_id=layer_id)
@@ -256,11 +258,10 @@ class ExpertProcessor:
         """Process single token through experts (decode mode).
 
         Strategy:
-        1. Get top-k experts for this token (typically k=2)
-        2. Check cache for each expert, load if needed
-        3. Process token through each expert
-        4. Combine outputs using router weights: sum(weight_i * expert_i_output)
-        5. Update predictor with activated experts
+        1. Collect all unique (expert_id, batch_idx, weight) across top-k
+        2. Load unique experts concurrently via ThreadPoolExecutor
+        3. Accumulate weighted outputs sequentially (tensor ops are cheap vs I/O)
+        4. Update predictor with activated experts
 
         Args:
             hidden_state: Input tensor [batch_size, 1, hidden_dim] or [batch_size, hidden_dim]
@@ -289,45 +290,57 @@ class ExpertProcessor:
 
         top_k = expert_indices.shape[-1]
 
-        # Initialize output
-        output = torch.zeros_like(hidden_state)  # [batch, hidden]
-
-        # Track activated experts for predictor
-        activated_experts = set()
-
-        # Process through each of the top-k experts
+        # Collect all (expert_id, batch_idx, weight) entries
+        entries: list[tuple[int, int, float]] = []
         for k_idx in range(top_k):
             for batch_idx in range(batch_size):
                 expert_id = expert_indices[batch_idx, k_idx].item()
-                weight = expert_weights[batch_idx, k_idx]
+                weight = expert_weights[batch_idx, k_idx].item()
+                entries.append((expert_id, batch_idx, weight))
 
-                activated_experts.add(expert_id)
+        # Load unique experts concurrently
+        unique_experts = list({eid for eid, _, _ in entries})
+        expert_map: dict[int, ExpertFFN] = {}
 
-                # Load expert if needed
-                if expert_loader is not None:
-                    loader_fn = lambda eid=expert_id: expert_loader(eid)
-                else:
-                    loader_fn = None
-
+        if expert_loader is not None and unique_experts:
+            with ThreadPoolExecutor(max_workers=len(unique_experts)) as pool:
+                futures = {
+                    pool.submit(self._get_expert, eid, layer_id,
+                                lambda _eid=eid: expert_loader(_eid)): eid
+                    for eid in unique_experts
+                }
+                for fut in futures:
+                    eid = futures[fut]
+                    try:
+                        expert_map[eid] = fut.result()
+                    except Exception:
+                        import logging
+                        logging.warning(f"Failed to load expert {eid} for layer {layer_id}")
+        else:
+            # No loader: try direct cache lookup for each unique expert
+            for eid in unique_experts:
                 try:
-                    expert = self._get_expert(expert_id, layer_id, loader_fn)
-                except Exception as e:
-                    # If expert loading fails, skip this expert to avoid segfault
-                    import logging
-                    logging.warning(f"Failed to load expert {expert_id} for layer {layer_id}: {e}")
-                    continue
+                    expert_map[eid] = self._get_expert(eid, layer_id, None)
+                except ValueError:
+                    pass
 
-                # Process token through expert
-                token_input = hidden_state[batch_idx:batch_idx+1]  # [1, hidden]
-                with torch.no_grad():
-                    expert_output = expert(token_input)  # [1, hidden]
+        # Accumulate outputs sequentially (tensor ops are cheap; avoids GIL contention)
+        output = torch.zeros_like(hidden_state)  # [batch, hidden]
+        activated_experts: set[int] = set()
 
-                # Weight and accumulate
-                output[batch_idx] += weight * expert_output.squeeze(0)
+        for expert_id, batch_idx, weight in entries:
+            activated_experts.add(expert_id)
+            expert = expert_map.get(expert_id)
+            if expert is None:
+                continue
+            token_input = hidden_state[batch_idx:batch_idx+1]  # [1, hidden]
+            with torch.no_grad():
+                expert_output = expert(token_input)  # [1, hidden]
+            output[batch_idx] += weight * expert_output.squeeze(0)
 
-                # Unpin expert after use
-                if expert_loader is not None:
-                    self.expert_cache.unpin(expert_id, layer_id)
+            # Unpin after use
+            if expert_loader is not None:
+                self.expert_cache.unpin(expert_id, layer_id)
 
         # Update predictor with activated experts
         if update_predictor and self.cache_manager is not None:
@@ -372,7 +385,10 @@ class ExpertProcessor:
         """Return processing statistics.
 
         Returns:
-            Dictionary with cache hit/miss counts and cache stats
+            Dictionary with cache hit/miss counts and cache stats.
+            Tier-aware hit/miss comes from the three-tier ExpertCache.get_stats()
+            (gpu_hits / cpu_hits / storage_hits), not from the processor's own
+            unconditional counter.
         """
         # Get cache stats from manager if available, otherwise from cache directly
         if self.cache_manager is not None:
@@ -383,9 +399,6 @@ class ExpertProcessor:
         return {
             "processor_cache_hits": self.cache_hits,
             "processor_cache_misses": self.cache_misses,
-            "cache_hit_rate": self.cache_hits / (self.cache_hits + self.cache_misses)
-            if (self.cache_hits + self.cache_misses) > 0
-            else 0.0,
             "last_activated_experts": self._last_activated_experts,
             **cache_stats,
         }
