@@ -26,7 +26,7 @@ from safetensors import safe_open
 
 from sparse_llm.inference.router_calculator import RouterCalculator
 from sparse_llm.inference.expert_processor import ExpertProcessor, ExpertFFN
-from sparse_llm.inference.attention_engine import AttentionEngine
+from sparse_llm.inference.attention_engine import AttentionEngine, RMSNorm
 from sparse_llm.inference.expert_cache_manager import ExpertCacheManager
 from sparse_llm.cache.expert_cache import ExpertCache
 try:
@@ -270,7 +270,11 @@ class CustomMoEInferenceEngine:
             head_dim=head_dim,
             max_seq_len=self.config.max_seq_len,
             device=str(self.device),
-            dtype=self.dtype
+            dtype=self.dtype,
+            # GQA/MQA: ModelInfo exposes num_key_value_heads (defaults to
+            # num_attention_heads for standard MHA). getattr keeps bare/legacy
+            # engines without the field on the MHA path.
+            num_kv_heads=getattr(self.model_info, "num_key_value_heads", None),
         )
 
         return attention
@@ -455,7 +459,168 @@ class CustomMoEInferenceEngine:
             self.router_weights_by_layer = {}
 
         logger.info(f"   ✓ Loaded {len(shared_weights)} shared weight tensors ({total_bytes / 1024**3:.2f}GB)")
+        # Eagerly bind per-layer attention projections and norms so a
+        # key-mismatch bug surfaces at load time, not mid-generation.
+        self._load_attention_and_norm_weights(shared_weights)
+
         return shared_weights
+
+    def _load_attention_and_norm_weights(self, shared_weights: dict) -> None:
+        """Eager weight-load timing: bind every layer's attention projections and
+        pre/post norms now, so missing keys are reported at load time."""
+        hidden = self.model_info.hidden_size
+        self.layer_norms: dict = {}
+        self._warned_norms: set = set()
+
+        for layer_id in range(self.model_info.num_layers):
+            self.attention_engine.load_layer_weights(shared_weights, layer_id)
+            self.layer_norms[layer_id] = {
+                "input_layernorm": self._load_norm(
+                    shared_weights, layer_id, "input_layernorm", hidden
+                ),
+                "post_attention_layernorm": self._load_norm(
+                    shared_weights, layer_id, "post_attention_layernorm", hidden
+                ),
+            }
+
+        self.final_norm = self._load_norm(shared_weights, None, "norm", hidden)
+
+    def _load_norm(self, shared_weights: dict, layer_id, name: str, hidden: int):
+        """Build an RMSNorm from checkpoint weights, or None (identity fallback)."""
+        if layer_id is None:
+            keys = ("model.norm.weight", "norm.weight")
+        else:
+            keys = (
+                f"model.layers.{layer_id}.{name}.weight",
+                f"layers.{layer_id}.{name}.weight",
+            )
+        for key in keys:
+            if key in shared_weights:
+                norm = RMSNorm(hidden, eps=1e-6).to(device=self.device, dtype=self.dtype)
+                with torch.no_grad():
+                    norm.weight.copy_(shared_weights[key].to(device=self.device, dtype=self.dtype))
+                return norm
+        if name not in self._warned_norms:
+            self._warned_norms.add(name)
+            logger.warning(f"Missing norm weights for '{name}'; using identity fallback.")
+        return None
+
+    @staticmethod
+    def _as_norm(norm):
+        """Accept an nn.Module, a raw weight Tensor (tests), or None."""
+        if norm is None:
+            return None
+        if isinstance(norm, torch.Tensor):
+            mod = RMSNorm(norm.shape[-1])
+            with torch.no_grad():
+                mod.weight.copy_(norm)
+            return mod
+        return norm
+
+    def _get_norm(self, layer_idx: int, name: str):
+        """Per-layer norm module; identity when absent."""
+        entry = getattr(self, "layer_norms", {}).get(layer_idx)
+        if not isinstance(entry, dict):
+            return torch.nn.Identity()
+        norm = self._as_norm(entry.get(name))
+        if norm is None:
+            return torch.nn.Identity()
+        # Cache a wrapped module so test-injected raw tensors wrap only once.
+        entry[name] = norm
+        if hasattr(norm, "to"):
+            norm = norm.to(self.device)
+            entry[name] = norm
+        return norm
+
+    def _apply_final_norm(self, h: torch.Tensor) -> torch.Tensor:
+        norm = self._as_norm(getattr(self, "final_norm", None))
+        return h if norm is None else norm(h)
+
+    def _apply_attention_layer(
+        self,
+        h: torch.Tensor,
+        layer_idx: int,
+        kv_cache,
+        mode: str = "decode",
+    ):
+        """One attention sublayer with its residual: h = h + attn(norm(h)).
+
+        `mode="prefill"` runs the whole prompt through one layer; `"decode"`
+        processes a single token. The caller owns the per-layer loop.
+        """
+        norm = self._get_norm(layer_idx, "input_layernorm")
+        normed = norm(h)
+
+        if mode == "prefill":
+            attn_out, kv_cache = self.attention_engine.prefill(
+                input_ids=normed, layer_idx=layer_idx, kv_cache=kv_cache
+            )
+        else:
+            attn_out, kv_cache = self.attention_engine.decode(
+                token_id=normed, layer_idx=layer_idx, kv_cache=kv_cache
+            )
+
+        return h + attn_out, kv_cache
+
+    def _apply_moe_layer(self, h: torch.Tensor, layer_idx: int, batch_mode: bool) -> torch.Tensor:
+        """One MoE sublayer with its residual: h = h + moe(norm(h))."""
+        norm = self._get_norm(layer_idx, "post_attention_layernorm")
+        normed = norm(h)
+
+        # Use layer-specific router weights if available.
+        if hasattr(self, 'router_weights_by_layer') and layer_idx in self.router_weights_by_layer:
+            original_weights = self.router_calculator.router_weights
+            self.router_calculator.router_weights = self.router_weights_by_layer[layer_idx]
+            expert_indices, expert_weights = self.router_calculator.forward(
+                normed, batch_mode=batch_mode
+            )
+            self.router_calculator.router_weights = original_weights
+        else:
+            expert_indices, expert_weights = self.router_calculator.forward(
+                normed, batch_mode=batch_mode
+            )
+
+        if batch_mode:
+            if layer_idx == 0:  # Only log for first layer to avoid spam
+                activated_experts = self._analyze_expert_frequency(expert_indices)
+                logger.info(f"Layer {layer_idx} prefill activated {len(activated_experts)} "
+                            f"unique experts: {activated_experts[:10]}")
+            out = self.expert_processor.process_batch(
+                hidden_states=normed,
+                expert_indices=expert_indices,
+                expert_weights=expert_weights,
+                layer_id=layer_idx,
+                expert_loader=self._create_expert_loader(layer_idx),
+                trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
+            )
+        else:
+            out = self.expert_processor.process_single(
+                hidden_state=normed,
+                expert_indices=expert_indices.squeeze(1),  # [batch, top_k]
+                expert_weights=expert_weights.squeeze(1),
+                layer_id=layer_idx,
+                expert_loader=self._create_expert_loader(layer_idx),
+                update_predictor=True,
+            )
+
+        return h + out
+
+    def _forward_one_token(self, current_hidden: torch.Tensor, kv_cache):
+        """Run every layer for one decode token. Shared by both decode paths.
+
+        R7 seq_len contract: AttentionEngine.decode writes K/V at
+        `kv_cache['seq_len']` and does NOT advance it. We advance it exactly
+        once per generated token, here, after the full layer loop. Advancing
+        inside `decode` would overshoot by num_layers per token.
+        """
+        for layer_id in range(self.model_info.num_layers):
+            current_hidden, kv_cache = self._apply_attention_layer(
+                current_hidden, layer_id, kv_cache, mode="decode"
+            )
+            current_hidden = self._apply_moe_layer(current_hidden, layer_id, batch_mode=False)
+
+        kv_cache['seq_len'] = kv_cache.get('seq_len', 0) + 1
+        return self._apply_final_norm(current_hidden), kv_cache
 
     def _load_expert_from_storage(
         self,
@@ -718,45 +883,14 @@ class CustomMoEInferenceEngine:
         # Step 1: Embed tokens
         hidden_states = self._embed_tokens(prompt_tokens)  # [batch, seq_len, hidden_dim]
 
-        # Step 2: Initialize KV cache
-        hidden_states, kv_cache = self.attention_engine.prefill(
-            hidden_states,
-            attention_mask=None
-        )
-
-        # Step 3: Process through ALL layers (CRITICAL FIX: was only layer 0)
+        # Step 2: Process through ALL layers: attention (with residual) then MoE.
+        # The KV cache is created on the first layer and threaded through.
+        kv_cache = None
         for layer_id in range(self.model_info.num_layers):
-            # Batch router computation for this layer
-            if hasattr(self, 'router_weights_by_layer') and layer_id in self.router_weights_by_layer:
-                original_weights = self.router_calculator.router_weights
-                self.router_calculator.router_weights = self.router_weights_by_layer[layer_id]
-                expert_indices, expert_weights = self.router_calculator.forward(
-                    hidden_states,
-                    batch_mode=True
-                )
-                self.router_calculator.router_weights = original_weights
-            else:
-                expert_indices, expert_weights = self.router_calculator.forward(
-                    hidden_states,
-                    batch_mode=True
-                )
-
-            # Analyze expert frequency for this layer (for cache warmup)
-            if layer_id == 0:  # Only log for first layer to avoid spam
-                activated_experts = self._analyze_expert_frequency(expert_indices)
-                logger.info(f"Layer {layer_id} prefill activated {len(activated_experts)} unique experts: "
-                           f"{activated_experts[:10]}")
-
-            # Process tokens through experts (grouped by expert)
-            # Three-tier cache handles loading automatically: GPU → CPU → Storage
-            hidden_states = self.expert_processor.process_batch(
-                hidden_states=hidden_states,
-                expert_indices=expert_indices,
-                expert_weights=expert_weights,
-                layer_id=layer_id,
-                expert_loader=self._create_expert_loader(layer_id),
-                trigger_prefetch=(layer_id == self.model_info.num_layers - 1)  # Only prefetch after last layer
+            hidden_states, kv_cache = self._apply_attention_layer(
+                hidden_states, layer_id, kv_cache, mode="prefill"
             )
+            hidden_states = self._apply_moe_layer(hidden_states, layer_id, batch_mode=True)
 
         # Return initial state for decode
         return GenerationState(
@@ -802,43 +936,10 @@ class CustomMoEInferenceEngine:
         for step in range(max_tokens):
             step_start = time.monotonic()
 
-            # Process through ALL layers (CRITICAL FIX: was only processing layer 0)
-            for layer_id in range(self.model_info.num_layers):
-                # Step 1: Attention for this layer
-                current_hidden, kv_cache = self.attention_engine.decode(
-                    token_id=current_hidden,
-                    kv_cache=kv_cache
-                )
+            # All layers for this token (attention + MoE, shared with streaming).
+            current_hidden, kv_cache = self._forward_one_token(current_hidden, kv_cache)
 
-                # Step 2: Route token to experts for this layer
-                # Use layer-specific router weights if available
-                if hasattr(self, 'router_weights_by_layer') and layer_id in self.router_weights_by_layer:
-                    # Temporarily swap router weights for this layer
-                    original_weights = self.router_calculator.router_weights
-                    self.router_calculator.router_weights = self.router_weights_by_layer[layer_id]
-                    expert_indices, expert_weights = self.router_calculator.forward(
-                        current_hidden,
-                        batch_mode=False
-                    )
-                    self.router_calculator.router_weights = original_weights
-                else:
-                    # Fallback to shared router (less accurate but works)
-                    expert_indices, expert_weights = self.router_calculator.forward(
-                        current_hidden,
-                        batch_mode=False
-                    )
-
-                # Step 3-5: Process through experts for this layer
-                current_hidden = self.expert_processor.process_single(
-                    hidden_state=current_hidden,
-                    expert_indices=expert_indices.squeeze(1),  # [batch, top_k]
-                    expert_weights=expert_weights.squeeze(1),
-                    layer_id=layer_id,
-                    expert_loader=self._create_expert_loader(layer_id),
-                    update_predictor=True
-                )
-
-            # Step 6: Generate next token
+            # Generate next token
             next_token = self._sample_next_token(
                 current_hidden,
                 temperature=temperature,
@@ -882,28 +983,8 @@ class CustomMoEInferenceEngine:
         kv_cache = initial_state.kv_cache
 
         for step in range(max_tokens):
-            # Attention
-            current_hidden, kv_cache = self.attention_engine.decode(
-                token_id=current_hidden,
-                kv_cache=kv_cache
-            )
-
-            # Routing
-            expert_indices, expert_weights = self.router_calculator.forward(
-                current_hidden,
-                batch_mode=False
-            )
-
-            # Expert processing
-            layer_id = 0
-            current_hidden = self.expert_processor.process_single(
-                hidden_state=current_hidden,
-                expert_indices=expert_indices.squeeze(1),
-                expert_weights=expert_weights.squeeze(1),
-                layer_id=layer_id,
-                expert_loader=self._create_expert_loader(layer_id),
-                update_predictor=True
-            )
+            # Same full per-layer body as _decode_phase (single source of truth).
+            current_hidden, kv_cache = self._forward_one_token(current_hidden, kv_cache)
 
             # Sample next token
             next_token = self._sample_next_token(
@@ -1202,7 +1283,7 @@ class CustomMoEInferenceEngine:
     def _cleanup(self):
         """Release resources after generation (called between requests)."""
         # Clear caches
-        if hasattr(self, 'attention_engine'):
+        if hasattr(self, 'attention_engine') and hasattr(self.attention_engine, 'clear_cache'):
             self.attention_engine.clear_cache()
 
         # Optionally clear expert cache (or keep hot experts)
