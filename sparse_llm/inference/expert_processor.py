@@ -13,6 +13,7 @@ from sparse_llm.cache.expert_cache import ExpertCache
 from sparse_llm.inference.expert_cache_manager import ExpertCacheManager
 from sparse_llm.inference.expert_fusion import ExpertFusionCache
 from sparse_llm.inference.path_tracker import ExpertPathTracker
+from sparse_llm.inference.prefetcher import PredictivePrefetcher
 
 
 class ExpertFFN(nn.Module):
@@ -109,6 +110,14 @@ class ExpertProcessor:
 
         # Fusion cache for pre-computed fused expert weights
         self._fusion_cache = ExpertFusionCache(max_fused_paths=1000)
+
+        # Predictive prefetcher for background expert prefetching
+        self._prefetcher: Optional[PredictivePrefetcher] = None
+        if enable_predictive_prefetch:
+            self._prefetcher = PredictivePrefetcher(
+                expert_loader=self._get_expert,
+                enable_background_thread=True,
+            )
 
     def _get_expert(
         self,
@@ -787,5 +796,24 @@ class ExpertProcessor:
         self.cache_hits = 0
         self.cache_misses = 0
 
+    def prefetch_next(self, current_experts: list[int], layer_id: int) -> None:
+        """Prefetch predicted next experts based on current activations.
 
-__all__ = ["ExpertProcessor", "ExpertFFN", "ExpertFusionCache"]
+        Args:
+            current_experts: Currently activated expert IDs
+            layer_id: Layer to prefetch for
+        """
+        if self._prefetcher:
+            self._prefetcher.predict_and_prefetch(current_experts, layer_id)
+
+    def observe_routing(self, expert_ids: list[int]) -> None:
+        """Observe expert routing patterns to learn transitions.
+
+        Args:
+            expert_ids: List of expert IDs that were activated
+        """
+        if self._prefetcher:
+            self._prefetcher.observe_layer(layer_id=0, expert_ids=expert_ids)
+
+
+__all__ = ["ExpertProcessor", "ExpertFFN", "ExpertFusionCache", "PredictivePrefetcher"]
