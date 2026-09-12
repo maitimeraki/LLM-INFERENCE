@@ -5,6 +5,7 @@ import torch
 
 from sparse_llm.cache.expert_cache import ExpertCache
 from sparse_llm.inference.expert_processor import ExpertProcessor, ExpertFFN
+from sparse_llm.inference.expert_fusion import ExpertFusionCache
 
 
 class TestTileExpertWeights:
@@ -417,6 +418,103 @@ class TestExpertProcessorGroupedBatchProcessing:
         loader = lambda eid: mock_experts[eid]
         processor.process_batch(hidden, routing, weights, expert_loader=loader)
         assert len(processor._last_activated_experts) > 0
+
+
+class TestExpertFusionCache:
+    """Test ExpertFusionCache functionality."""
+
+    @pytest.fixture
+    def fusion_cache(self):
+        return ExpertFusionCache(max_fused_paths=10)
+
+    @pytest.fixture
+    def tiled_weights(self):
+        return {
+            "w1": torch.randn(4, 128, 64),
+            "w2": torch.randn(4, 64, 128),
+            "w3": torch.randn(4, 128, 64),
+        }
+
+    def test_get_fused_computes_and_caches(self, fusion_cache, tiled_weights):
+        """Should compute and cache fused weights on first call."""
+        fused = fusion_cache.get_fused(1, [0, 1], [0.6, 0.4], tiled_weights)
+        assert "w1" in fused
+        assert "w2" in fused
+        assert "w3" in fused
+        # Same call should return cached result
+        fused2 = fusion_cache.get_fused(1, [0, 1], [0.6, 0.4], tiled_weights)
+        assert fused is fused2
+
+    def test_get_fused_lru_eviction(self, fusion_cache, tiled_weights):
+        """Should evict LRU entry when cache is full."""
+        # Fill cache beyond max
+        for i in range(15):
+            fusion_cache.get_fused(i, [0], [1.0], tiled_weights)
+        assert fusion_cache.get_stats()["num_entries"] <= fusion_cache.max_fused_paths
+
+    def test_invalidate_single_entry(self, fusion_cache, tiled_weights):
+        """Should invalidate single cache entry."""
+        fusion_cache.get_fused(1, [0, 1], [0.6, 0.4], tiled_weights)
+        fusion_cache.invalidate(1)
+        assert 1 not in fusion_cache._fused
+
+    def test_invalidate_all(self, fusion_cache, tiled_weights):
+        """Should clear all entries."""
+        fusion_cache.get_fused(1, [0], [1.0], tiled_weights)
+        fusion_cache.get_fused(2, [1], [1.0], tiled_weights)
+        fusion_cache.invalidate()
+        assert len(fusion_cache._fused) == 0
+
+    def test_get_stats(self, fusion_cache, tiled_weights):
+        """Should return correct stats."""
+        fusion_cache.get_fused(1, [0], [1.0], tiled_weights)
+        fusion_cache.get_fused(1, [0], [1.0], tiled_weights)  # Access again
+        stats = fusion_cache.get_stats()
+        assert stats["num_entries"] == 1
+        assert stats["total_accesses"] >= 2
+
+
+class TestProcessBatchFused:
+    """Test process_batch_fused integration."""
+
+    @pytest.fixture
+    def processor(self):
+        cache = ExpertCache(max_experts=16)
+        return ExpertProcessor(
+            expert_cache=cache,
+            num_experts=4,
+            hidden_dim=64,
+            expert_dim=128,
+            activation="silu",
+            device="cpu",
+        )
+
+    @pytest.fixture
+    def mock_experts(self):
+        experts = {}
+        for i in range(4):
+            experts[i] = ExpertFFN(hidden_dim=64, expert_dim=128, activation="silu", has_gate=True)
+        return experts
+
+    def test_process_batch_fused_output_shape(self, processor, mock_experts):
+        """Output should match input shape."""
+        loader = lambda eid: mock_experts[eid]
+        batch_size, seq_len = 2, 4
+        hidden = torch.randn(batch_size, seq_len, 64)
+        routing = torch.randint(0, 4, (batch_size, seq_len, 2))
+        weights = torch.softmax(torch.randn(batch_size, seq_len, 2), dim=-1)
+        output = processor.process_batch_fused(hidden, routing, weights, expert_loader=loader)
+        assert output.shape == hidden.shape
+
+    def test_process_batch_fused_caches_paths(self, processor, mock_experts):
+        """Should populate fusion cache on first call."""
+        loader = lambda eid: mock_experts[eid]
+        batch_size, seq_len = 2, 4
+        hidden = torch.randn(batch_size, seq_len, 64)
+        routing = torch.randint(0, 4, (batch_size, seq_len, 2))
+        weights = torch.softmax(torch.randn(batch_size, seq_len, 2), dim=-1)
+        processor.process_batch_fused(hidden, routing, weights, expert_loader=loader)
+        assert processor._fusion_cache.get_stats()["num_entries"] > 0
 
 
 if __name__ == "__main__":

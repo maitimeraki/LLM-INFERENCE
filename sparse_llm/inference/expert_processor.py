@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from sparse_llm.cache.expert_cache import ExpertCache
 from sparse_llm.inference.expert_cache_manager import ExpertCacheManager
+from sparse_llm.inference.expert_fusion import ExpertFusionCache
 from sparse_llm.inference.path_tracker import ExpertPathTracker
 
 
@@ -105,6 +106,9 @@ class ExpertProcessor:
 
         # Tiled weight cache: layer_id -> {'w1': tensor, 'w2': tensor, 'w3': tensor}
         self._tiled_weights_cache: dict[int, dict[str, torch.Tensor]] = {}
+
+        # Fusion cache for pre-computed fused expert weights
+        self._fusion_cache = ExpertFusionCache(max_fused_paths=1000)
 
     def _get_expert(
         self,
@@ -553,6 +557,74 @@ class ExpertProcessor:
 
         return output
 
+    def process_batch_fused(
+        self,
+        hidden_states: torch.Tensor,
+        expert_indices: torch.Tensor,
+        expert_weights: torch.Tensor,
+        layer_id: Optional[int] = None,
+        expert_loader: Optional[Callable[[int], ExpertFFN]] = None,
+    ) -> torch.Tensor:
+        """Process batch using fused expert weights for common paths.
+
+        Uses pre-computed fused weights to reduce multiple matmuls to single matmul
+        for paths that appear frequently.
+
+        Args:
+            hidden_states: Input tensor [batch_size, seq_len, hidden_dim]
+            expert_indices: Expert assignments [batch_size, seq_len, top_k]
+            expert_weights: Router weights [batch_size, seq_len, top_k]
+            layer_id: Optional layer identifier
+            expert_loader: Optional function to load expert by ID
+
+        Returns:
+            Combined output tensor [batch_size, seq_len, hidden_dim]
+        """
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+
+        fingerprints = self._compute_batch_fingerprints(expert_indices)
+        groups = self._group_by_fingerprint(hidden_states, expert_indices, fingerprints)
+        tiled_weights = self._tile_expert_weights(layer_id, expert_loader)
+
+        output = torch.zeros(
+            batch_size * seq_len, hidden_dim,
+            device=hidden_states.device, dtype=hidden_states.dtype
+        )
+
+        for fp, group in groups.items():
+            expert_ids = list(group["expert_ids"])
+            group_indices = group["indices"]
+            group_routing = expert_indices.view(batch_size * seq_len, -1)[group_indices]
+            group_weights = expert_weights.view(batch_size * seq_len, -1)[group_indices]
+
+            # Average routing weights per expert for this group
+            avg_weights: dict[int, float] = {}
+            for i in range(group_routing.shape[0]):
+                for k in range(group_routing.shape[1]):
+                    eid = group_routing[i, k].item()
+                    w = group_weights[i, k].item()
+                    avg_weights[eid] = avg_weights.get(eid, 0.0) + w
+            for eid in avg_weights:
+                avg_weights[eid] /= len(group_indices)
+
+            fused_weights = self._fusion_cache.get_fused(
+                fp, expert_ids, list(avg_weights.values()), tiled_weights
+            )
+
+            group_hidden = group["hidden"]
+            has_gate = "w3" in fused_weights
+
+            if has_gate:
+                x1 = F.silu(group_hidden @ fused_weights["w1"].t())
+                x3 = group_hidden @ fused_weights["w3"].t()
+                group_output = x1 * x3 @ fused_weights["w2"].t()
+            else:
+                group_output = F.gelu(group_hidden @ fused_weights["w1"].t()) @ fused_weights["w2"].t()
+
+            output[group_indices] = group_output
+
+        return output.reshape(batch_size, seq_len, hidden_dim)
+
     def process_single(
         self,
         hidden_state: torch.Tensor,
@@ -620,9 +692,9 @@ class ExpertProcessor:
                     eid = futures[fut]
                     try:
                         expert_map[eid] = fut.result()
-                    except Exception:
+                    except Exception as e:
                         import logging
-                        logging.warning(f"Failed to load expert {eid} for layer {layer_id}")
+                        logging.error(f"Failed to load expert {eid} for layer {layer_id}: {e}")
         else:
             # No loader: try direct cache lookup for each unique expert
             for eid in unique_experts:
@@ -716,4 +788,4 @@ class ExpertProcessor:
         self.cache_misses = 0
 
 
-__all__ = ["ExpertProcessor", "ExpertFFN"]
+__all__ = ["ExpertProcessor", "ExpertFFN", "ExpertFusionCache"]
