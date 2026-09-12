@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Optional, List
+from functools import partial
+from typing import Callable, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sparse_llm.cache.expert_cache import ExpertCache
+from sparse_llm.loading.expert_cache import ExpertCache
 from sparse_llm.inference.expert_cache_manager import ExpertCacheManager
 from sparse_llm.inference.expert_fusion import ExpertFusionCache
 from sparse_llm.inference.path_tracker import ExpertPathTracker
@@ -300,7 +301,7 @@ class ExpertProcessor:
 
         for expert_id in range(num_experts):
             if expert_loader is not None:
-                loader_fn = lambda eid=expert_id: expert_loader(eid)
+                loader_fn = partial(expert_loader, expert_id)
                 expert = self._get_expert(expert_id, layer_id, loader_fn)
             else:
                 expert = self._get_expert(expert_id, layer_id, None)
@@ -356,12 +357,13 @@ class ExpertProcessor:
             token_hidden = hidden[token_indices]
 
             # Compute expert output once for all tokens
+            act_fn = getattr(F, self.activation.split('_')[0], F.gelu) if self.activation else F.gelu
             if has_gate:
-                x1 = F.silu(token_hidden @ tiled_weights['w1'][expert_id].t())
+                x1 = act_fn(token_hidden @ tiled_weights['w1'][expert_id].t())
                 x3 = token_hidden @ tiled_weights['w3'][expert_id].t()
                 expert_out = x1 * x3 @ tiled_weights['w2'][expert_id].t()
             else:
-                expert_out = F.gelu(token_hidden @ tiled_weights['w1'][expert_id].t()) @ tiled_weights['w2'][expert_id].t()
+                expert_out = act_fn(token_hidden @ tiled_weights['w1'][expert_id].t()) @ tiled_weights['w2'][expert_id].t()
 
             # Apply weights: each token may route to expert multiple times
             for i, tok_idx in enumerate(token_indices):
@@ -435,7 +437,7 @@ class ExpertProcessor:
             for expert_id in group['expert_ids']:
                 activated_experts.add(expert_id)
                 if expert_loader is not None:
-                    loader_fn = lambda eid=expert_id: expert_loader(eid)
+                    loader_fn = partial(expert_loader, expert_id)
                 else:
                     loader_fn = None
                 try:
@@ -622,13 +624,14 @@ class ExpertProcessor:
 
             group_hidden = group["hidden"]
             has_gate = "w3" in fused_weights
+            act_fn = getattr(F, self.activation.split('_')[0], F.gelu) if self.activation else F.gelu
 
             if has_gate:
-                x1 = F.silu(group_hidden @ fused_weights["w1"].t())
+                x1 = act_fn(group_hidden @ fused_weights["w1"].t())
                 x3 = group_hidden @ fused_weights["w3"].t()
                 group_output = x1 * x3 @ fused_weights["w2"].t()
             else:
-                group_output = F.gelu(group_hidden @ fused_weights["w1"].t()) @ fused_weights["w2"].t()
+                group_output = act_fn(group_hidden @ fused_weights["w1"].t()) @ fused_weights["w2"].t()
 
             output[group_indices] = group_output
 
@@ -694,7 +697,7 @@ class ExpertProcessor:
             with ThreadPoolExecutor(max_workers=len(unique_experts)) as pool:
                 futures = {
                     pool.submit(self._get_expert, eid, layer_id,
-                                lambda _eid=eid: expert_loader(_eid)): eid
+                                partial(expert_loader, eid)): eid
                     for eid in unique_experts
                 }
                 for fut in futures:
