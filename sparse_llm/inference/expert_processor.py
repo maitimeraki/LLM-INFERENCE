@@ -57,6 +57,7 @@ class ExpertProcessor:
     Supports two modes:
     - Batched processing for prefill: group tokens by expert, process in batch
     - Single-token processing for decode: process through top-k experts, combine
+    - Tiled processing: batch tensor operations on contiguous expert weights
 
     Integrates with ExpertCacheManager for predictive prefetching and optimization.
     """
@@ -101,6 +102,9 @@ class ExpertProcessor:
         self.cache_hits = 0
         self.cache_misses = 0
         self._last_activated_experts: List[int] = []
+
+        # Tiled weight cache: layer_id -> {'w1': tensor, 'w2': tensor, 'w3': tensor}
+        self._tiled_weights_cache: dict[int, dict[str, torch.Tensor]] = {}
 
     def _get_expert(
         self,
@@ -246,6 +250,127 @@ class ExpertProcessor:
 
         return output
 
+    def _tile_expert_weights(
+        self,
+        layer_id: int,
+        expert_loader: Optional[Callable[[int], ExpertFFN]] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Load expert weights as tiled tensors for batch access.
+
+        Current: [expert_0_w1, expert_1_w1, ...] - scattered
+        Tiled:   [num_experts, hidden, expert_dim] - contiguous
+
+        Enables: expert_weights[[3, 7, 11]] - batch gather.
+
+        Args:
+            layer_id: Layer identifier for layer-aware caching
+            expert_loader: Optional function to load expert by ID
+
+        Returns:
+            Dictionary with tiled weight tensors: {'w1': tensor, 'w2': tensor, 'w3': tensor}
+        """
+        # Check cache first
+        if layer_id in self._tiled_weights_cache:
+            return self._tiled_weights_cache[layer_id]
+
+        num_experts = self.num_experts
+        hidden_dim = self.hidden_dim
+        expert_dim = self.expert_dim
+        has_gate = self.activation in ("silu", "swiglu")
+
+        # Stack w1, w2, w3 weights into contiguous tensors
+        # Linear weights are [out_features, in_features]
+        # w1: [expert_dim, hidden_dim], w2: [hidden_dim, expert_dim], w3: [expert_dim, hidden_dim]
+        w1_tiled = torch.zeros(num_experts, expert_dim, hidden_dim, device=self.device, dtype=torch.float32)
+        w2_tiled = torch.zeros(num_experts, hidden_dim, expert_dim, device=self.device, dtype=torch.float32)
+        w3_tiled = torch.zeros(num_experts, expert_dim, hidden_dim, device=self.device, dtype=torch.float32) if has_gate else torch.zeros(1, device=self.device)
+
+        for expert_id in range(num_experts):
+            if expert_loader is not None:
+                loader_fn = lambda eid=expert_id: expert_loader(eid)
+                expert = self._get_expert(expert_id, layer_id, loader_fn)
+            else:
+                expert = self._get_expert(expert_id, layer_id, None)
+
+            with torch.no_grad():
+                w1_tiled[expert_id] = expert.w1.weight
+                w2_tiled[expert_id] = expert.w2.weight
+                if expert.w3 is not None:
+                    w3_tiled[expert_id] = expert.w3.weight
+
+        tiled_weights = {'w1': w1_tiled, 'w2': w2_tiled}
+        if has_gate:
+            tiled_weights['w3'] = w3_tiled
+
+        # Cache the tiled weights
+        self._tiled_weights_cache[layer_id] = tiled_weights
+        return tiled_weights
+
+    def _process_group_tiled(
+        self,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        weights: torch.Tensor,
+        tiled_weights: dict[str, torch.Tensor],
+        expert_ids: list[int],
+    ) -> torch.Tensor:
+        """Process group using tiled/batched tensor operations.
+
+        Args:
+            hidden: Hidden states for this group [num_tokens, hidden]
+            routing: Expert indices for this group [num_tokens, top_k]
+            weights: Router weights for this group [num_tokens, top_k]
+            tiled_weights: Pre-tiled weight tensors
+            expert_ids: List of expert IDs in this group
+
+        Returns:
+            Output tensor [num_tokens, hidden]
+        """
+        num_tokens = hidden.shape[0]
+        output = torch.zeros_like(hidden)
+
+        has_gate = 'w3' in tiled_weights and tiled_weights['w3'].shape[0] > 1
+
+        for expert_id in expert_ids:
+            # Find tokens that route to this expert (at any position)
+            mask = (routing == expert_id).any(dim=1)
+            token_indices = mask.nonzero().squeeze(-1)
+
+            if len(token_indices) == 0:
+                continue
+
+            # Get hidden states for these tokens
+            token_hidden = hidden[token_indices]
+
+            # Compute expert output once for all tokens
+            if has_gate:
+                x1 = F.silu(token_hidden @ tiled_weights['w1'][expert_id].t())
+                x3 = token_hidden @ tiled_weights['w3'][expert_id].t()
+                expert_out = x1 * x3 @ tiled_weights['w2'][expert_id].t()
+            else:
+                expert_out = F.gelu(token_hidden @ tiled_weights['w1'][expert_id].t()) @ tiled_weights['w2'][expert_id].t()
+
+            # Apply weights: each token may route to expert multiple times
+            for i, tok_idx in enumerate(token_indices):
+                tok_routing = routing[tok_idx]
+                tok_weights = weights[tok_idx]
+                for k in range(routing.shape[1]):
+                    if tok_routing[k] == expert_id:
+                        output[tok_idx] += expert_out[i] * tok_weights[k]
+
+        return output
+
+    def invalidate_tiled_cache(self, layer_id: Optional[int] = None) -> None:
+        """Invalidate tiled weight cache.
+
+        Args:
+            layer_id: Specific layer to invalidate, or None to clear all
+        """
+        if layer_id is None:
+            self._tiled_weights_cache.clear()
+        elif layer_id in self._tiled_weights_cache:
+            del self._tiled_weights_cache[layer_id]
+
     def process_batch(
         self,
         hidden_states: torch.Tensor,
@@ -328,6 +453,88 @@ class ExpertProcessor:
                         self.expert_cache.unpin(expert_id, layer_id)
                     except Exception:
                         pass
+
+        # Reshape to original batch structure
+        output = output.reshape(batch_size, seq_len, hidden_dim)
+
+        # Update predictor and trigger prefetching
+        self._last_activated_experts = list(activated_experts)
+        if (
+            trigger_prefetch
+            and self.enable_predictive_prefetch
+            and self.cache_manager is not None
+            and expert_loader is not None
+        ):
+            self.cache_manager.optimize_cache_for_decode(
+                self._last_activated_experts, expert_loader, layer_id
+            )
+
+        return output
+
+    def process_batch_tiled(
+        self,
+        hidden_states: torch.Tensor,
+        expert_indices: torch.Tensor,
+        expert_weights: torch.Tensor,
+        layer_id: Optional[int] = None,
+        expert_loader: Optional[Callable[[int], ExpertFFN]] = None,
+        trigger_prefetch: bool = True,
+    ) -> torch.Tensor:
+        """Process batch of tokens using tiled/batched tensor operations.
+
+        This method uses pre-tiled expert weights for batch gather operations,
+        which can be more efficient for large batches with many expert accesses.
+
+        Args:
+            hidden_states: Input tensor [batch_size, seq_len, hidden_dim]
+            expert_indices: Expert assignments [batch_size, seq_len, top_k]
+            expert_weights: Router weights [batch_size, seq_len, top_k]
+            layer_id: Optional layer identifier for layer-aware caching
+            expert_loader: Optional function to load expert by ID
+            trigger_prefetch: Whether to trigger prefetching after this batch
+
+        Returns:
+            Combined output tensor [batch_size, seq_len, hidden_dim]
+        """
+        batch_size, seq_len, hidden_dim = hidden_states.shape
+
+        # Compute fingerprints for grouping
+        fingerprints = self._compute_batch_fingerprints(expert_indices)
+
+        # Group tokens by fingerprint
+        groups = self._group_by_fingerprint(hidden_states, expert_indices, fingerprints)
+
+        # Get tiled weights (cached per layer)
+        tiled_weights = self._tile_expert_weights(layer_id, expert_loader)
+
+        # Initialize output
+        output = torch.zeros(batch_size * seq_len, hidden_dim,
+                           device=hidden_states.device, dtype=hidden_states.dtype)
+
+        # Track activated experts for prefetching
+        activated_experts = set()
+
+        # Process each group
+        for fp, group in groups.items():
+            # Collect expert IDs needed for this group
+            group_expert_ids = list(group['expert_ids'])
+            activated_experts.update(group_expert_ids)
+
+            # Get routing for this group
+            group_indices = group['indices']
+            group_routing = expert_indices.view(batch_size * seq_len, -1)[group_indices]
+            group_weights = expert_weights.view(batch_size * seq_len, -1)[group_indices]
+
+            # Process group with tiled weights
+            group_output = self._process_group_tiled(
+                group['hidden'],
+                group_routing,
+                group_weights,
+                tiled_weights,
+                group_expert_ids,
+            )
+
+            output[group_indices] = group_output
 
         # Reshape to original batch structure
         output = output.reshape(batch_size, seq_len, hidden_dim)

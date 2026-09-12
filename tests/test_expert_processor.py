@@ -1,10 +1,212 @@
-"""Tests for ExpertProcessor grouping functionality."""
+"""Tests for ExpertProcessor grouping and tiling functionality."""
 
 import pytest
 import torch
 
 from sparse_llm.cache.expert_cache import ExpertCache
 from sparse_llm.inference.expert_processor import ExpertProcessor, ExpertFFN
+
+
+class TestTileExpertWeights:
+    """Test tiled weight operations."""
+
+    @pytest.fixture
+    def processor(self):
+        """Create processor instance for tests."""
+        cache = ExpertCache(max_experts=16)
+        return ExpertProcessor(
+            expert_cache=cache,
+            num_experts=4,
+            hidden_dim=64,
+            expert_dim=128,
+            activation="silu",
+            device="cpu",
+        )
+
+    @pytest.fixture
+    def mock_experts(self):
+        """Create mock experts with gate (silu activation)."""
+        experts = {}
+        for i in range(4):
+            experts[i] = ExpertFFN(hidden_dim=64, expert_dim=128, activation="silu", has_gate=True)
+        return experts
+
+    def test_tile_weights_returns_dict(self, processor, mock_experts):
+        """Should return dictionary with w1, w2, w3 tensors."""
+        loader = lambda eid: mock_experts[eid]
+        tiled = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        assert isinstance(tiled, dict)
+        assert 'w1' in tiled
+        assert 'w2' in tiled
+        assert 'w3' in tiled
+
+    def test_tile_weights_shape(self, processor, mock_experts):
+        """Tiled weights should have correct shapes."""
+        loader = lambda eid: mock_experts[eid]
+        tiled = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        # Linear weights are [out_features, in_features]
+        assert tiled['w1'].shape == (4, 128, 64)  # [num_experts, expert_dim, hidden]
+        assert tiled['w2'].shape == (4, 64, 128)  # [num_experts, hidden, expert_dim]
+        assert tiled['w3'].shape == (4, 128, 64)  # [num_experts, expert_dim, hidden]
+
+    def test_tile_weights_caching(self, processor, mock_experts):
+        """Same layer should return cached tiled weights."""
+        loader = lambda eid: mock_experts[eid]
+        tiled1 = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        tiled2 = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        assert tiled1 is tiled2  # Same object due to caching
+
+    def test_tile_weights_different_layers(self, processor, mock_experts):
+        """Different layers should have different cached weights."""
+        loader = lambda eid: mock_experts[eid]
+        tiled1 = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        tiled2 = processor._tile_expert_weights(layer_id=1, expert_loader=loader)
+        assert tiled1 is not tiled2
+
+    def test_tile_weights_invalidate_cache(self, processor, mock_experts):
+        """Invalidate should clear cache."""
+        loader = lambda eid: mock_experts[eid]
+        processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        assert 0 in processor._tiled_weights_cache
+        processor.invalidate_tiled_cache(layer_id=0)
+        assert 0 not in processor._tiled_weights_cache
+
+    def test_tile_weights_invalidate_all(self, processor, mock_experts):
+        """Invalidate with no args should clear all."""
+        loader = lambda eid: mock_experts[eid]
+        processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+        processor._tile_expert_weights(layer_id=1, expert_loader=loader)
+        assert len(processor._tiled_weights_cache) == 2
+        processor.invalidate_tiled_cache()
+        assert len(processor._tiled_weights_cache) == 0
+
+
+class TestProcessGroupTiled:
+    """Test _process_group_tiled functionality."""
+
+    @pytest.fixture
+    def processor(self):
+        """Create processor instance for tests."""
+        cache = ExpertCache(max_experts=16)
+        return ExpertProcessor(
+            expert_cache=cache,
+            num_experts=4,
+            hidden_dim=64,
+            expert_dim=128,
+            activation="silu",
+            device="cpu",
+        )
+
+    @pytest.fixture
+    def mock_experts(self):
+        """Create mock experts."""
+        experts = {}
+        for i in range(4):
+            experts[i] = ExpertFFN(hidden_dim=64, expert_dim=128, activation="silu", has_gate=True)
+        return experts
+
+    def test_process_group_tiled_shape(self, processor, mock_experts):
+        """Should return tensor with correct shape."""
+        loader = lambda eid: mock_experts[eid]
+        tiled_weights = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+
+        hidden = torch.randn(4, 64)
+        routing = torch.tensor([[0, 1], [0, 1], [2, 3], [2, 3]])
+        weights = torch.softmax(torch.randn(4, 2), dim=-1)
+        expert_ids = [0, 1, 2, 3]
+
+        output = processor._process_group_tiled(hidden, routing, weights, tiled_weights, expert_ids)
+        assert output.shape == hidden.shape
+
+    def test_process_group_tiled_single_expert(self, processor, mock_experts):
+        """Should handle single expert correctly."""
+        loader = lambda eid: mock_experts[eid]
+        tiled_weights = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+
+        hidden = torch.randn(2, 64)
+        routing = torch.tensor([[0, 0], [0, 0]])  # Same expert twice
+        weights = torch.ones(2, 2)
+        expert_ids = [0]
+
+        output = processor._process_group_tiled(hidden, routing, weights, tiled_weights, expert_ids)
+        assert output.shape == hidden.shape
+
+    def test_process_group_tiled_empty_tokens(self, processor, mock_experts):
+        """Should handle empty token group gracefully."""
+        loader = lambda eid: mock_experts[eid]
+        tiled_weights = processor._tile_expert_weights(layer_id=0, expert_loader=loader)
+
+        hidden = torch.randn(0, 64)
+        routing = torch.zeros(0, 2, dtype=torch.long)
+        weights = torch.zeros(0, 2)
+        expert_ids = [0]
+
+        output = processor._process_group_tiled(hidden, routing, weights, tiled_weights, expert_ids)
+        assert output.shape == hidden.shape
+
+
+class TestProcessBatchTiled:
+    """Test process_batch_tiled functionality."""
+
+    @pytest.fixture
+    def processor(self):
+        """Create processor instance for tests."""
+        cache = ExpertCache(max_experts=16)
+        return ExpertProcessor(
+            expert_cache=cache,
+            num_experts=4,
+            hidden_dim=64,
+            expert_dim=128,
+            activation="silu",
+            device="cpu",
+        )
+
+    @pytest.fixture
+    def mock_experts(self):
+        """Create mock experts."""
+        experts = {}
+        for i in range(4):
+            experts[i] = ExpertFFN(hidden_dim=64, expert_dim=128, activation="silu", has_gate=True)
+        return experts
+
+    def test_process_batch_tiled_output_shape(self, processor, mock_experts):
+        """Output should match input shape."""
+        loader = lambda eid: mock_experts[eid]
+        batch_size, seq_len = 2, 4
+        hidden = torch.randn(batch_size, seq_len, 64)
+        routing = torch.randint(0, 4, (batch_size, seq_len, 2))
+        weights = torch.softmax(torch.randn(batch_size, seq_len, 2), dim=-1)
+        output = processor.process_batch_tiled(hidden, routing, weights, expert_loader=loader)
+        assert output.shape == hidden.shape
+
+    def test_process_batch_tiled_with_identical_routing(self, processor, mock_experts):
+        """All tokens same routing should produce one group."""
+        loader = lambda eid: mock_experts[eid]
+        batch_size, seq_len = 3, 4
+        hidden = torch.randn(batch_size, seq_len, 64)
+        routing = torch.full((batch_size, seq_len, 2), 1)
+        routing[:, :, 1] = 2
+        weights = torch.softmax(torch.randn(batch_size, seq_len, 2), dim=-1)
+        output = processor.process_batch_tiled(hidden, routing, weights, expert_loader=loader)
+        assert output.shape == hidden.shape
+
+    def test_process_batch_tiled_consistency_with_standard(self, processor, mock_experts):
+        """Tiled and standard batch should produce similar outputs."""
+        loader = lambda eid: mock_experts[eid]
+        batch_size, seq_len = 2, 4
+        torch.manual_seed(42)
+        hidden = torch.randn(batch_size, seq_len, 64)
+        routing = torch.randint(0, 4, (batch_size, seq_len, 2))
+        weights = torch.softmax(torch.randn(batch_size, seq_len, 2), dim=-1)
+
+        # Clear cache for fair comparison
+        processor.invalidate_tiled_cache()
+
+        output_standard = processor.process_batch(hidden, routing, weights, expert_loader=loader)
+        output_tiled = processor.process_batch_tiled(hidden, routing, weights, expert_loader=loader)
+
+        # Should be numerically similar (within floating point tolerance)
+        assert torch.allclose(output_standard, output_tiled, rtol=1e-4, atol=1e-6)
 
 
 class TestExpertProcessorGrouping:
