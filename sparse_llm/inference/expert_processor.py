@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 from sparse_llm.cache.expert_cache import ExpertCache
 from sparse_llm.inference.expert_cache_manager import ExpertCacheManager
+from sparse_llm.inference.path_tracker import ExpertPathTracker
 
 
 class ExpertFFN(nn.Module):
@@ -141,6 +142,110 @@ class ExpertProcessor:
 
         return expert
 
+    def _compute_batch_fingerprints(
+        self,
+        routing: torch.Tensor,  # [batch, seq, top_k]
+    ) -> torch.Tensor:
+        """Compute fingerprints for each token's expert path.
+
+        Args:
+            routing: Expert indices [batch, seq, top_k]
+
+        Returns:
+            Fingerprints tensor [batch, seq]
+        """
+        B, S, top_k = routing.shape
+        flat_routing = routing.view(-1, top_k)  # [B*S, top_k]
+
+        # Simple hash: XOR fold expert IDs with position weighting
+        fingerprints = torch.zeros(B * S, dtype=torch.long, device=routing.device)
+        for k in range(top_k):
+            fingerprints ^= flat_routing[:, k].long() * (self.num_experts ** k)
+        return fingerprints.view(B, S)
+
+    def _group_by_fingerprint(
+        self,
+        hidden_states: torch.Tensor,  # [batch, seq, hidden]
+        routing: torch.Tensor,  # [batch, seq, top_k] - expert indices per token
+        fingerprints: torch.Tensor,  # [batch, seq] - path fingerprint per token
+    ) -> dict[int, dict]:
+        """Group tokens by their expert path fingerprint.
+
+        Args:
+            hidden_states: Input hidden states [batch, seq, hidden]
+            routing: Expert assignments [batch, seq, top_k]
+            fingerprints: Computed fingerprints [batch, seq]
+
+        Returns:
+            groups: dict[fingerprint -> {
+                'indices': LongTensor of original positions,
+                'expert_ids': set of expert IDs needed,
+                'hidden': tensor of hidden states for group
+            }]
+        """
+        B, S, H = hidden_states.shape
+        flat_hidden = hidden_states.view(-1, H)
+        flat_fp = fingerprints.view(-1)
+        flat_routing = routing.view(-1, routing.shape[-1])  # [B*S, top_k]
+
+        # Group by fingerprint
+        groups: dict[int, dict] = {}
+        for idx, fp in enumerate(flat_fp.tolist()):
+            if fp not in groups:
+                groups[fp] = {
+                    'indices': [],
+                    'expert_ids': set(),
+                }
+            groups[fp]['indices'].append(idx)
+            # Collect expert IDs
+            for expert_id in flat_routing[idx].tolist():
+                groups[fp]['expert_ids'].add(expert_id)
+
+        # Convert indices to tensor and add hidden states
+        for fp, group in groups.items():
+            indices = torch.tensor(group['indices'], device=hidden_states.device, dtype=torch.long)
+            group['indices'] = indices
+            group['hidden'] = flat_hidden[indices]
+
+        return groups
+
+    def _process_group(
+        self,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        weights: torch.Tensor,
+        expert_modules: dict[int, ExpertFFN],
+    ) -> torch.Tensor:
+        """Process a group of tokens with the same expert path.
+
+        Args:
+            hidden: Hidden states for this group [num_tokens, hidden]
+            routing: Expert indices for this group [num_tokens, top_k]
+            weights: Router weights for this group [num_tokens, top_k]
+            expert_modules: Pre-loaded expert modules {expert_id: ExpertFFN}
+
+        Returns:
+            Output tensor [num_tokens, hidden]
+        """
+        num_tokens, hidden_dim = hidden.shape
+        output = torch.zeros_like(hidden)
+
+        # Process each token's expert contributions
+        for token_idx in range(num_tokens):
+            token_hidden = hidden[token_idx:token_idx + 1]  # [1, hidden]
+            token_experts = routing[token_idx]  # [top_k]
+            token_weights = weights[token_idx]  # [top_k]
+
+            for expert_id, weight in zip(token_experts.tolist(), token_weights.tolist()):
+                expert = expert_modules.get(expert_id)
+                if expert is None:
+                    continue
+                with torch.no_grad():
+                    expert_output = expert(token_hidden)  # [1, hidden]
+                output[token_idx] += weight * expert_output.squeeze(0)
+
+        return output
+
     def process_batch(
         self,
         hidden_states: torch.Tensor,
@@ -171,63 +276,58 @@ class ExpertProcessor:
             Combined output tensor [batch_size, seq_len, hidden_dim]
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
-        top_k = expert_indices.shape[-1]
 
-        # Flatten batch and sequence dimensions for processing
-        flat_hidden = hidden_states.reshape(-1, hidden_dim)  # [batch*seq, hidden]
-        flat_indices = expert_indices.reshape(-1, top_k)  # [batch*seq, top_k]
-        flat_weights = expert_weights.reshape(-1, top_k)  # [batch*seq, top_k]
+        # Compute fingerprints for grouping
+        fingerprints = self._compute_batch_fingerprints(expert_indices)  # [B, S]
 
-        # Initialize output accumulator
-        output = torch.zeros_like(flat_hidden)
+        # Group tokens by fingerprint
+        groups = self._group_by_fingerprint(hidden_states, expert_indices, fingerprints)
+
+        # Initialize output
+        output = torch.zeros(batch_size * seq_len, hidden_dim,
+                           device=hidden_states.device, dtype=hidden_states.dtype)
 
         # Track activated experts for prefetching
         activated_experts = set()
 
-        # Process each expert position (typically k=2)
-        for k_idx in range(top_k):
-            expert_ids = flat_indices[:, k_idx]  # [batch*seq]
-            weights = flat_weights[:, k_idx]  # [batch*seq]
-
-            # Group tokens by expert
-            for expert_id in range(self.num_experts):
-                # Find all tokens assigned to this expert
-                mask = expert_ids == expert_id
-                if not mask.any():
-                    continue
-
+        # Process each group (experts loaded once per group)
+        for fp, group in groups.items():
+            # Load experts for this group (ONCE)
+            expert_modules: dict[int, ExpertFFN] = {}
+            for expert_id in group['expert_ids']:
                 activated_experts.add(expert_id)
-
-                # Get tokens for this expert
-                expert_inputs = flat_hidden[mask]  # [num_tokens, hidden]
-                expert_weights_subset = weights[mask]  # [num_tokens]
-
-                # Load expert if needed
                 if expert_loader is not None:
-                    # Fix closure issue with default parameter
                     loader_fn = lambda eid=expert_id: expert_loader(eid)
                 else:
                     loader_fn = None
-
                 try:
-                    expert = self._get_expert(expert_id, layer_id, loader_fn)
+                    expert_modules[expert_id] = self._get_expert(expert_id, layer_id, loader_fn)
                 except Exception as e:
-                    # If expert loading fails, skip this expert to avoid segfault
                     import logging
                     logging.warning(f"Failed to load expert {expert_id} for layer {layer_id}: {e}")
-                    continue
 
-                # Process tokens through expert
-                with torch.no_grad():
-                    expert_output = expert(expert_inputs)  # [num_tokens, hidden]
+            # Get routing for this group
+            group_indices = group['indices']
+            group_routing = expert_indices.view(batch_size * seq_len, -1)[group_indices]
+            group_weights = expert_weights.view(batch_size * seq_len, -1)[group_indices]
 
-                # Weight and accumulate outputs
-                weighted_output = expert_output * expert_weights_subset.unsqueeze(-1)
-                output[mask] += weighted_output
+            # Process group
+            group_output = self._process_group(
+                group['hidden'],
+                group_routing,
+                group_weights,
+                expert_modules
+            )
 
-                # Unpin expert after use
-                if expert_loader is not None:
-                    self.expert_cache.unpin(expert_id, layer_id)
+            output[group_indices] = group_output
+
+            # Unpin experts after group processing
+            if expert_loader is not None:
+                for expert_id in expert_modules:
+                    try:
+                        self.expert_cache.unpin(expert_id, layer_id)
+                    except Exception:
+                        pass
 
         # Reshape to original batch structure
         output = output.reshape(batch_size, seq_len, hidden_dim)
