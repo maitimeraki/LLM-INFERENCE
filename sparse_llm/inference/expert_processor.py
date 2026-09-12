@@ -806,14 +806,15 @@ class ExpertProcessor:
         if self._prefetcher:
             self._prefetcher.predict_and_prefetch(current_experts, layer_id)
 
-    def observe_routing(self, expert_ids: list[int]) -> None:
+    def observe_routing(self, expert_ids: list[int], layer_id: int = 0) -> None:
         """Observe expert routing patterns to learn transitions.
 
         Args:
             expert_ids: List of expert IDs that were activated
+            layer_id: Layer index for tracking
         """
         if self._prefetcher:
-            self._prefetcher.observe_layer(layer_id=0, expert_ids=expert_ids)
+            self._prefetcher.observe_layer(layer_id=layer_id, expert_ids=expert_ids)
 
 
 __all__ = ["ExpertProcessor", "ExpertFFN", "ExpertFusionCache", "PredictivePrefetcher"]

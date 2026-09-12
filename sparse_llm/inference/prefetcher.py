@@ -10,9 +10,18 @@ import logging
 import queue
 import threading
 from collections import Counter
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExpertCentricConfig:
+    """Configuration for expert-centric MoE inference."""
+    enable_prefetch: bool = True  # Predictive prefetch
+    prefetch_queue_size: int = 16  # Prefetch queue depth
+    top_k_predictions: int = 3  # Number of top predicted experts to prefetch
 
 
 class PredictivePrefetcher:
@@ -43,6 +52,7 @@ class PredictivePrefetcher:
         self.expert_loader = expert_loader
         self.prefetch_queue: queue.Queue = queue.Queue(maxsize=prefetch_queue_size)
         self.transition_probs: dict[int, Counter] = {}
+        self._lock = threading.Lock()  # ponytail: global lock, add per-key locks if contention matters
         self._stop_event = threading.Event()
         self.top_k_predictions = top_k_predictions
 
@@ -62,10 +72,11 @@ class PredictivePrefetcher:
             expert_id: Current expert that was activated
             next_expert_ids: Experts that followed in subsequent layers
         """
-        if expert_id not in self.transition_probs:
-            self.transition_probs[expert_id] = Counter()
-        for next_id in next_expert_ids:
-            self.transition_probs[expert_id][next_id] += 1
+        with self._lock:
+            if expert_id not in self.transition_probs:
+                self.transition_probs[expert_id] = Counter()
+            for next_id in next_expert_ids:
+                self.transition_probs[expert_id][next_id] += 1
 
     def observe_layer(self, layer_id: int, expert_ids: list[int]) -> None:
         """Observe a full layer's expert activations.
@@ -85,18 +96,19 @@ class PredictivePrefetcher:
             current_experts: Currently activated expert IDs
             layer_id: Layer to prefetch for
         """
-        for expert_id in current_experts:
-            if expert_id in self.transition_probs:
-                # Get top predicted next experts
-                next_experts = [
-                    exp for exp, _ in self.transition_probs[expert_id].most_common(self.top_k_predictions)
-                ]
-                for next_exp in next_experts:
-                    try:
-                        self.prefetch_queue.put_nowait((next_exp, layer_id))
-                    except queue.Full:
-                        # Queue full, skip remaining predictions
-                        break
+        with self._lock:
+            for expert_id in current_experts:
+                if expert_id in self.transition_probs:
+                    # Get top predicted next experts
+                    next_experts = [
+                        exp for exp, _ in self.transition_probs[expert_id].most_common(self.top_k_predictions)
+                    ]
+                    for next_exp in next_experts:
+                        try:
+                            self.prefetch_queue.put_nowait((next_exp, layer_id))
+                        except queue.Full:
+                            # Queue full, skip remaining predictions
+                            break
 
     def _prefetch_worker(self) -> None:
         """Background thread that prefetches queued experts."""
@@ -141,4 +153,4 @@ class PredictivePrefetcher:
         }
 
 
-__all__ = ["PredictivePrefetcher"]
+__all__ = ["PredictivePrefetcher", "ExpertCentricConfig"]

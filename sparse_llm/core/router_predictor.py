@@ -9,11 +9,13 @@ logger = logging.getLogger(__name__)
 class RouterPredictor:
     """Predicts next expert activation using Markov chains and router bias."""
 
-    def __init__(self, num_experts: int, num_top_predictions: int = 10):
+    def __init__(self, num_experts: int, sequence_length: int = 10, num_top_predictions: int = 10):
         self.num_experts = num_experts
+        self.sequence_length = sequence_length
         self.num_top_predictions = num_top_predictions
         self.markov_matrix: Optional[np.ndarray] = None
         self.router_bias_history: List[np.ndarray] = []
+        self.expert_sequences: List[List[int]] = []
         self.max_history = 100
 
     def build_markov_matrix(self, expert_sequences: List[List[int]]) -> None:
@@ -64,3 +66,68 @@ class RouterPredictor:
         top_indices = np.argsort(-predictions)[:self.num_top_predictions]
         top_scores = predictions[top_indices]
         return top_indices.tolist(), top_scores.tolist()
+
+    def predict_next_experts(
+        self,
+        current_experts: List[int],
+        top_k: int = 15,
+        confidence_threshold: float = 0.30
+    ) -> Tuple[List[int], List[float]]:
+        """
+        Predict next experts for prefetching with confidence filtering.
+
+        Args:
+            current_experts: Currently active expert IDs
+            top_k: Maximum number of predictions to return
+            confidence_threshold: Minimum confidence to include prediction
+
+        Returns:
+            Tuple of (predicted_expert_ids, confidence_scores)
+        """
+        # Use existing predict method
+        predicted_ids, scores = self.predict(current_experts)
+
+        # Filter by confidence threshold and limit to top_k
+        filtered_predictions = []
+        filtered_scores = []
+
+        for expert_id, score in zip(predicted_ids, scores):
+            if score >= confidence_threshold and len(filtered_predictions) < top_k:
+                filtered_predictions.append(expert_id)
+                filtered_scores.append(score)
+
+        return filtered_predictions, filtered_scores
+
+    def update_from_inference(
+        self,
+        activated_experts: List[int],
+        router_logits: Optional[np.ndarray] = None
+    ) -> None:
+        """
+        Update predictor with real inference data.
+
+        Args:
+            activated_experts: List of expert IDs activated in this step
+            router_logits: Optional router logits (numpy array)
+        """
+        # Track expert sequences
+        self.expert_sequences.append(activated_experts)
+        if len(self.expert_sequences) > self.max_history:
+            self.expert_sequences.pop(0)
+
+        # Rebuild Markov matrix periodically
+        if len(self.expert_sequences) >= 10:
+            self.build_markov_matrix(self.expert_sequences)
+
+        # Record router bias if provided
+        if router_logits is not None:
+            self.record_router_bias(router_logits)
+
+    def stats(self) -> Dict:
+        """Get predictor statistics."""
+        return {
+            "num_experts": self.num_experts,
+            "sequence_history_length": len(self.expert_sequences),
+            "router_bias_history_length": len(self.router_bias_history),
+            "has_markov_matrix": self.markov_matrix is not None,
+        }

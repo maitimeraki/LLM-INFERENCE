@@ -602,8 +602,8 @@ class CustomMoEInferenceEngine:
             )
 
         if batch_mode:
+            activated_experts = self._analyze_expert_frequency(expert_indices)
             if layer_idx == 0:  # Only log for first layer to avoid spam
-                activated_experts = self._analyze_expert_frequency(expert_indices)
                 logger.info(f"Layer {layer_idx} prefill activated {len(activated_experts)} "
                             f"unique experts: {activated_experts[:10]}")
             out = self.expert_processor.process_batch(
@@ -614,7 +614,13 @@ class CustomMoEInferenceEngine:
                 expert_loader=self._create_expert_loader(layer_idx),
                 trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
             )
+            # Learn routing patterns for prefetching
+            self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
+            # Prefetch next layer's predicted experts
+            if layer_idx < self.model_info.num_layers - 1:
+                self.expert_processor.prefetch_next(activated_experts, layer_id=layer_idx + 1)
         else:
+            activated_experts = self._analyze_expert_frequency(expert_indices)
             out = self.expert_processor.process_single(
                 hidden_state=normed,
                 expert_indices=expert_indices.squeeze(1),  # [batch, top_k]
@@ -623,6 +629,8 @@ class CustomMoEInferenceEngine:
                 expert_loader=self._create_expert_loader(layer_idx),
                 update_predictor=True,
             )
+            # Observe routing for decode mode
+            self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
 
         return h + out
 
