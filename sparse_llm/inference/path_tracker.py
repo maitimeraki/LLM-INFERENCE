@@ -5,7 +5,6 @@ reducing expert loads from "per token" to "per unique path".
 """
 
 from collections import Counter
-from typing import Optional
 import torch
 
 
@@ -13,9 +12,9 @@ class ExpertPathTracker:
     """
     Track routing paths to enable expert-centric batching.
 
-    For each token, record:
+    For each token, records:
     - path_fingerprint: hash of (layer_0_experts, layer_1_experts, ...)
-    - routing_weights: per-layer routing probabilities
+    - expert frequency and transitions for prediction
     """
 
     def __init__(self, num_layers: int, top_k: int):
@@ -44,15 +43,20 @@ class ExpertPathTracker:
         for expert_id in flat_experts:
             self._expert_frequency[expert_id] += 1
 
-        # Update transitions (for prefetch)
-        flat = routing_decisions.flatten()
-        for i in range(len(flat) - self.top_k):
-            expert = flat[i].item()
-            next_layer_experts = flat[i + self.top_k:i + 2 * self.top_k].tolist()
-            if expert not in self._transitions:
-                self._transitions[expert] = Counter()
-            for next_exp in next_layer_experts:
-                self._transitions[expert][next_exp] += 1
+        # Update transitions - reshape to [batch*seq, num_layers, top_k]
+        batch_seq = routing_decisions.shape[0] * routing_decisions.shape[1]
+        num_layers = routing_decisions.shape[2]
+        top_k = routing_decisions.shape[3]
+        tokens = routing_decisions.view(batch_seq, num_layers, top_k)
+        for token_idx in range(batch_seq):
+            for layer_idx in range(num_layers - 1):
+                current_experts = tokens[token_idx, layer_idx].tolist()
+                next_experts = tokens[token_idx, layer_idx + 1].tolist()
+                for cur_exp in current_experts:
+                    if cur_exp not in self._transitions:
+                        self._transitions[cur_exp] = Counter()
+                    for nxt_exp in next_experts:
+                        self._transitions[cur_exp][nxt_exp] += 1
 
         return fingerprint
 
