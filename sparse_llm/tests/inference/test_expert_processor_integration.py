@@ -23,7 +23,7 @@ class TestExpertProcessorWithCacheManager(unittest.TestCase):
 
         # Create cache and predictor
         self.cache = ExpertCache(max_experts=10, max_bytes=10 * 1024 * 1024)
-        self.predictor = RouterPredictor(num_experts=self.num_experts, markov_window=20)
+        self.predictor = RouterPredictor(num_experts=self.num_experts, sequence_length=20)
         self.cache_manager = ExpertCacheManager(
             self.cache,
             self.predictor,
@@ -325,7 +325,7 @@ class TestExpertProcessorPrefetchEffectiveness(unittest.TestCase):
         self.num_experts = 16
 
         self.cache = ExpertCache(max_experts=20, max_bytes=20 * 1024 * 1024)
-        self.predictor = RouterPredictor(num_experts=self.num_experts, markov_window=50)
+        self.predictor = RouterPredictor(num_experts=self.num_experts, sequence_length=50)
         self.cache_manager = ExpertCacheManager(
             self.cache,
             self.predictor,

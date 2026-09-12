@@ -18,7 +18,7 @@ class TestExpertCacheManager(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.cache = ExpertCache(max_experts=10, max_bytes=1024 * 1024)
-        self.predictor = RouterPredictor(num_experts=16, markov_window=10)
+        self.predictor = RouterPredictor(num_experts=16, sequence_length=10)
         self.manager = ExpertCacheManager(
             self.cache,
             self.predictor,
@@ -359,7 +359,7 @@ class TestExpertCacheManagerIntegration(unittest.TestCase):
     def setUp(self):
         """Set up test fixtures."""
         self.cache = ExpertCache(max_experts=20, max_bytes=2 * 1024 * 1024)
-        self.predictor = RouterPredictor(num_experts=32, markov_window=50)
+        self.predictor = RouterPredictor(num_experts=32, sequence_length=50)
         self.manager = ExpertCacheManager(
             self.cache,
             self.predictor,
