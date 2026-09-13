@@ -577,6 +577,7 @@ class ExpertProcessor:
         expert_weights: torch.Tensor,
         layer_id: Optional[int] = None,
         expert_loader: Optional[Callable[[int], ExpertFFN]] = None,
+        trigger_prefetch: bool = True,
     ) -> torch.Tensor:
         """Process batch using fused expert weights for common paths.
 
@@ -589,6 +590,7 @@ class ExpertProcessor:
             expert_weights: Router weights [batch_size, seq_len, top_k]
             layer_id: Optional layer identifier
             expert_loader: Optional function to load expert by ID
+            trigger_prefetch: Whether to trigger prefetching for next layer
 
         Returns:
             Combined output tensor [batch_size, seq_len, hidden_dim]
