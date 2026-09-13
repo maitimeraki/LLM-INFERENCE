@@ -163,7 +163,18 @@ For each layer:
 
 ---
 
-## ❌ NOT YET IMPLEMENTED (Required for 10 tok/s)
+## ⚠️ PARTIALLY IMPLEMENTED (Integration Needed)
+
+### Implementation Status Table
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| ExpertPathTracker | ✅ Implemented | `path_tracker.py`, unused by engine |
+| Batch Fingerprinting | ✅ Implemented | `_compute_batch_fingerprints()` exists |
+| Expert Grouping | ✅ Implemented | `_group_by_fingerprint()` exists |
+| Expert Weight Tiling | ✅ Implemented | `_tile_expert_weights()` exists |
+| Expert Fusion | ✅ Implemented | `ExpertFusionCache` exists |
+| Predictive Prefetch | ✅ Implemented | `PredictivePrefetcher` exists |
 
 ### 1. Expert Path Fingerprinting & Grouping
 
@@ -171,7 +182,7 @@ For each layer:
 
 **Why:** Current code processes tokens independently. Grouping reduces expert loads by 10x
 
-**Implementation needed:**
+**Implementation:** (See `path_tracker.py` for actual implementation)
 ```python
 class ExpertPathTracker:
     """
@@ -212,7 +223,7 @@ class ExpertPathTracker:
 
 **Why:** Load each expert ONCE per group, not ONCE per token
 
-**Implementation needed:**
+**Implementation:** Available via `ExpertProcessor.process_batch_tiled()` and `ExpertProcessor.process_batch_fused()`
 ```python
 def process_expert_centric_batch(
     self,
@@ -261,7 +272,7 @@ def process_expert_centric_batch(
 
 **Why:** Single memory read vs. multiple small reads
 
-**Implementation needed:**
+**Implementation:** Available via `ExpertProcessor._tile_expert_weights()`**
 ```python
 def _tile_expert_weights(self, layer_id: int) -> dict[str, torch.Tensor]:
     """
@@ -290,7 +301,7 @@ def _tile_expert_weights(self, layer_id: int) -> dict[str, torch.Tensor]:
 
 **Why:** Single matrix multiply vs. multiple small multiplies
 
-**Implementation needed:**
+**Implementation:** Available via `ExpertFusionCache` class**
 ```python
 class ExpertFusionCache:
     """
@@ -337,7 +348,7 @@ class ExpertFusionCache:
 
 **Why:** Overlap I/O with compute
 
-**Implementation needed:**
+**Implementation:** Available via `PredictivePrefetcher` class**
 ```python
 class PredictivePrefetcher:
     """
@@ -491,15 +502,35 @@ class ExpertCentricConfig:
 
 ## Conclusion
 
-The architecture is **75% foundation done**. What's needed:
+The architecture is **100% implemented** - integration into engine remains.
 
 1. ✅ Shared weights on GPU: **IMPLEMENTED**
 2. ✅ Three-tier cache: **IMPLEMENTED**
 3. ✅ Safetensors index: **IMPLEMENTED**
-4. ❌ Expert path tracking: **NOT YET**
-5. ❌ Expert-centric grouping: **NOT YET**
-6. ❌ Expert weight tiling: **NOT YET**
-7. ❌ Expert fusion: **NOT YET**
-8. ❌ Predictive prefetch: **NOT YET**
+4. ✅ Expert path tracking: **IMPLEMENTED** (not wired to engine)
+5. ✅ Expert-centric grouping: **IMPLEMENTED** (not wired to engine)
+6. ✅ Expert weight tiling: **IMPLEMENTED** (not wired to engine)
+7. ✅ Expert fusion: **IMPLEMENTED** (not wired to engine)
+8. ✅ Predictive prefetch: **IMPLEMENTED** (not wired to engine)
 
-The foundation is solid. Adding expert path tracking and grouping should be the first priority - this alone can provide **5-10x speedup** by reducing expert loads from "per token" to "per unique path".
+---
+
+## Integration Status (2026-09-13)
+
+### Wired to Engine
+- Shared weights loading: ✅ Fully integrated
+- Three-tier cache: ✅ Fully integrated
+- Safetensors index: ✅ Fully integrated
+- Router calculator: ✅ Fully integrated (real weights from checkpoint)
+
+### Ready for Integration
+- ExpertProcessor.process_batch_tiled(): Available, needs mode flag
+- ExpertProcessor.process_batch_fused(): Available, needs mode flag
+- ExpertPathTracker: Available at path_tracker.py
+- ExpertFusionCache: Available at expert_fusion.py
+- PredictivePrefetcher: Available at prefetcher.py
+
+### Integration Work
+1. Add `expert_processing_mode` config flag to InferenceConfig
+2. Pass mode to ExpertProcessor.__init__
+3. Dispatch to tiled/fused in _apply_moe_layer()
