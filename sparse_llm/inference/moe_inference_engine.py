@@ -715,7 +715,8 @@ class CustomMoEInferenceEngine:
                     trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
                 )
             # Learn routing patterns for prefetching
-            self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
+            if hasattr(self.expert_processor, 'observe_routing'):
+                self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
             # Prefetch next layer's predicted experts
             if layer_idx < self.model_info.num_layers - 1:
                 self.expert_processor.prefetch_next(activated_experts, layer_id=layer_idx + 1)
@@ -730,7 +731,8 @@ class CustomMoEInferenceEngine:
                 update_predictor=True,
             )
             # Observe routing for decode mode
-            self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
+            if hasattr(self.expert_processor, 'observe_routing'):
+                self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
 
         return h + out
 

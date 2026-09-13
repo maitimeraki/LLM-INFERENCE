@@ -153,7 +153,7 @@ class ExpertProcessor:
             # not from unconditional counter increments here.
         else:
             # Simple cache lookup
-            expert = self.expert_cache.get(layer_id, expert_id)
+            expert = self.expert_cache.get(expert_id, layer_id=layer_id)
             if expert is None:
                 raise ValueError(
                     f"Expert {expert_id} (layer {layer_id}) not in cache and no loader provided"
