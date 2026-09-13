@@ -74,6 +74,7 @@ class ExpertProcessor:
         activation: str = "gelu",
         device: str = "cuda",
         enable_predictive_prefetch: bool = True,
+        processing_mode: str = "standard",
     ):
         """Initialize expert processor.
 
@@ -100,6 +101,7 @@ class ExpertProcessor:
         self.activation = activation
         self.device = device
         self.enable_predictive_prefetch = enable_predictive_prefetch
+        self.processing_mode = processing_mode
 
         # Stats tracking
         self.cache_hits = 0
@@ -151,7 +153,7 @@ class ExpertProcessor:
             # not from unconditional counter increments here.
         else:
             # Simple cache lookup
-            expert = self.expert_cache.get(expert_id, layer_id=layer_id)
+            expert = self.expert_cache.get(layer_id, expert_id)
             if expert is None:
                 raise ValueError(
                     f"Expert {expert_id} (layer {layer_id}) not in cache and no loader provided"

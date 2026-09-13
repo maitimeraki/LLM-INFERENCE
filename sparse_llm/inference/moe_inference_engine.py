@@ -68,6 +68,9 @@ class InferenceConfig:
     allow_cpu_offload: bool = True
     allow_ssd_offload: bool = True
 
+    # Expert processing mode
+    expert_processing_mode: str = "standard"  # "standard" | "tiled" | "fused"
+
     # Performance tuning
     use_flash_attention: bool = True
     compile_model: bool = False  # torch.compile support
@@ -156,10 +159,6 @@ class CustomMoEInferenceEngine:
 
         # Safetensors key→file index (built once after model path is available)
         self._safetensors_index: dict[str, tuple[Path, str]] = {}
-        # ponytail: pre-loaded expert weights in CPU RAM to avoid safetensors mmap + CUDA crash
-        # Root cause: safetensors uses memory mapping which conflicts with CUDA ops on Windows.
-        # Fix: load ALL expert weights into RAM once, then copy to GPU as needed.
-        self._expert_weights_cpu: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
         # Module cache: (layer_id, expert_id) → ExpertFFN, built once per (layer, expert)
         self._expert_module_cache: dict[tuple[int, int], ExpertFFN] = {}
 
@@ -240,7 +239,7 @@ class CustomMoEInferenceEngine:
         from transformers import AutoTokenizer
 
         logger.info("Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=False)
 
         # Ensure pad token is set
         if tokenizer.pad_token is None:
@@ -347,7 +346,8 @@ class CustomMoEInferenceEngine:
             expert_dim=self.model_info.intermediate_size,
             activation="gelu",
             device=str(self.device),
-            enable_predictive_prefetch=self.config.enable_predictive_prefetch
+            enable_predictive_prefetch=self.config.enable_predictive_prefetch,
+            processing_mode=getattr(self.config, 'expert_processing_mode', 'standard'),
         )
 
         return processor
@@ -684,14 +684,36 @@ class CustomMoEInferenceEngine:
             if layer_idx == 0:  # Only log for first layer to avoid spam
                 logger.info(f"Layer {layer_idx} prefill activated {len(activated_experts)} "
                             f"unique experts: {activated_experts[:10]}")
-            out = self.expert_processor.process_batch(
-                hidden_states=normed,
-                expert_indices=expert_indices,
-                expert_weights=expert_weights,
-                layer_id=layer_idx,
-                expert_loader=self._create_expert_loader(layer_idx),
-                trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
-            )
+            # Dispatch based on processing mode
+            mode = getattr(self.expert_processor, 'processing_mode', 'standard')
+
+            if mode == "fused":
+                out = self.expert_processor.process_batch_fused(
+                    hidden_states=normed,
+                    expert_indices=expert_indices,
+                    expert_weights=expert_weights,
+                    layer_id=layer_idx,
+                    expert_loader=self._create_expert_loader(layer_idx),
+                    trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
+                )
+            elif mode == "tiled":
+                out = self.expert_processor.process_batch_tiled(
+                    hidden_states=normed,
+                    expert_indices=expert_indices,
+                    expert_weights=expert_weights,
+                    layer_id=layer_idx,
+                    expert_loader=self._create_expert_loader(layer_idx),
+                    trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
+                )
+            else:  # standard
+                out = self.expert_processor.process_batch(
+                    hidden_states=normed,
+                    expert_indices=expert_indices,
+                    expert_weights=expert_weights,
+                    layer_id=layer_idx,
+                    expert_loader=self._create_expert_loader(layer_idx),
+                    trigger_prefetch=(layer_idx == self.model_info.num_layers - 1),
+                )
             # Learn routing patterns for prefetching
             self.expert_processor.observe_routing(activated_experts, layer_id=layer_idx)
             # Prefetch next layer's predicted experts
