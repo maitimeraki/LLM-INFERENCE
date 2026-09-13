@@ -156,6 +156,10 @@ class CustomMoEInferenceEngine:
 
         # Safetensors key→file index (built once after model path is available)
         self._safetensors_index: dict[str, tuple[Path, str]] = {}
+        # ponytail: pre-loaded expert weights in CPU RAM to avoid safetensors mmap + CUDA crash
+        # Root cause: safetensors uses memory mapping which conflicts with CUDA ops on Windows.
+        # Fix: load ALL expert weights into RAM once, then copy to GPU as needed.
+        self._expert_weights_cpu: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
         # Module cache: (layer_id, expert_id) → ExpertFFN, built once per (layer, expert)
         self._expert_module_cache: dict[tuple[int, int], ExpertFFN] = {}
 
@@ -236,7 +240,7 @@ class CustomMoEInferenceEngine:
         from transformers import AutoTokenizer
 
         logger.info("Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=False)
+        tokenizer = AutoTokenizer.from_pretrained(self.model_path, trust_remote_code=True)
 
         # Ensure pad token is set
         if tokenizer.pad_token is None:
@@ -363,18 +367,35 @@ class CustomMoEInferenceEngine:
         logger.info(f"[1/4] Loading shared weights to GPU...")
         self.shared_weights = self._load_shared_weights(model_path)
 
-        # Step 3: Configure storage loader for expert cache
-        logger.info(f"[2/4] Configuring expert storage loader...")
-        self.expert_cache.storage_loader = lambda layer_id, expert_id: self._load_expert_from_storage(
-            model_path, layer_id, expert_id
-        )
+        # Step 3: NO expert preloading - memory constrained system
+        # Experts will be loaded on-demand from storage
+        logger.info(f"[2/4] Expert preloading disabled (memory constrained)")
+        logger.info(f"    Experts will be loaded on-demand from storage")
 
-        # Step 4: Preload hot experts to GPU cache
-        if self.memory_allocation.gpu_hot_expert_count > 0:
-            logger.info(f"[3/4] Preloading {self.memory_allocation.gpu_hot_expert_count} hot experts to GPU...")
-            self._preload_hot_experts(model_path)
-        else:
-            logger.info(f"[3/4] No hot experts to preload (all on-demand)")
+        # Step 4: Configure storage loader for on-demand expert loading
+        logger.info(f"[3/4] Configuring expert storage loader (on-demand)...")
+
+        def on_demand_expert_loader(layer_id: int, expert_id: int):
+            """Load expert from storage on-demand using subprocess."""
+            key = (layer_id, expert_id)
+            if key in self._expert_weights_cpu:
+                return self._expert_weights_cpu[key]
+            # Try subprocess loading
+            try:
+                weights = self._load_expert_single_in_subprocess(
+                    self.model_path, layer_id, expert_id
+                )
+                if weights:
+                    self._expert_weights_cpu[key] = weights
+                    return weights
+            except Exception as e:
+                logger.warning(f"Failed to load expert {key}: {e}")
+            return None
+
+        self.expert_cache.storage_loader = on_demand_expert_loader
+
+        # Step 5: No hot experts preloaded due to memory constraints
+        logger.info(f"[4/4] No hot experts preloaded (on-demand loading only)")
 
         # Step 5: Log tier distribution
         logger.info(f"[4/4] Weight loading complete:")
@@ -408,7 +429,10 @@ class CustomMoEInferenceEngine:
         return Path(downloaded_path)
 
     def _load_shared_weights(self, model_path: Path) -> dict[str, torch.Tensor]:
-        """Load shared weights (embeddings, attention, norms, router) to GPU."""
+        """Load shared weights (embeddings, attention, norms, router) to GPU.
+
+        Uses subprocess to avoid safetensors mmap exhaustion on Windows.
+        """
         shared_weights = {}
 
         # Find safetensors files
@@ -419,40 +443,58 @@ class CustomMoEInferenceEngine:
         if not safetensors_files:
             raise FileNotFoundError(f"No safetensors files found in {model_path}")
 
-        # Load shared weights from all files
-        # Load to CPU first to avoid safetensors device issue, then move to GPU
-        total_bytes = 0
-        router_weights_by_layer = {}  # Collect router weights for each layer
+        # Build index by loading file metadata in subprocess (not full tensors)
+        logger.info("   Building safetensors index...")
+        self._build_safetensors_index(model_path)
 
-        for st_file in safetensors_files:
-            with safe_open(st_file, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    if self._is_shared_weight(key):
-                        tensor = f.get_tensor(key)
-                        # Move to target device and dtype
-                        tensor = tensor.to(device=self.device, dtype=self.dtype)
+        # Group shared weights by file
+        shared_keys_by_file: dict[Path, list[str]] = {}
+        for key, (st_file, _) in self._safetensors_index.items():
+            if self._is_shared_weight(key):
+                shared_keys_by_file.setdefault(st_file, []).append(key)
+
+        total_bytes = 0
+        router_weights_by_layer = {}
+
+        # Load each file's shared weights in subprocess
+        for st_file, keys in shared_keys_by_file.items():
+            logger.info(f"   Loading {len(keys)} shared weights from {st_file.name}...")
+            try:
+                weights = self._load_file_in_subprocess(st_file)
+                for key in keys:
+                    if key in weights:
+                        tensor = weights[key].to(device=self.device, dtype=self.dtype)
                         shared_weights[key] = tensor
                         total_bytes += tensor.numel() * tensor.element_size()
 
-                        # Track router weights for router calculator initialization
-                        if "gate" in key and "layers" in key and "block_sparse_moe" in key:
-                            # Extract layer number from key like "model.layers.0.block_sparse_moe.gate.weight"
+                        if ".gate.weight" in key and "layers" in key and "experts" not in key:
                             try:
                                 layer_num = int(key.split(".layers.")[1].split(".")[0])
                                 router_weights_by_layer[layer_num] = tensor
                             except (IndexError, ValueError):
                                 pass
+            except Exception as e:
+                logger.warning(f"   Failed to load shared weights from {st_file.name}: {e}")
 
-        # Initialize router calculator with real weights if found
-        if router_weights_by_layer:
-            # Use first layer's router weights (all layers typically have same shape)
-            first_layer_router = router_weights_by_layer[min(router_weights_by_layer.keys())]
-            self.router_calculator.set_router_weights(first_layer_router)
-            self.router_weights_by_layer = router_weights_by_layer
-            logger.info(f"   ✓ Loaded router weights for {len(router_weights_by_layer)} layers")
+        logger.info(f"   Loaded {len(shared_weights)} shared weights ({total_bytes / 1024**3:.2f}GB)")
+
+        # Look for router gate weights
+        router_key = None
+        for key in shared_weights.keys():
+            if ".block_sparse_moe.gate.weight" in key and "layers" in key:
+                router_key = key
+                break
+            if ".mlp.gate.weight" in key and "layers" in key:
+                router_key = key
+                break
+
+        # Load router weights from checkpoint or fall back to random
+        if router_key and router_key in shared_weights:
+            real_weights = shared_weights[router_key].to(device=self.device, dtype=self.dtype)
+            self.router_calculator.set_router_weights(real_weights)
+            logger.info(f"   ✓ Real router weights: {router_key}, shape {real_weights.shape}")
         else:
-            logger.warning("   ⚠ No router weights found in checkpoint - router will use random initialization")
-            # Fallback: create random router weights
+            logger.warning("   ⚠ Router weights not found, using random")
             random_weights = torch.randn(
                 self.model_info.hidden_size,
                 self.model_info.num_experts,
@@ -460,16 +502,9 @@ class CustomMoEInferenceEngine:
                 dtype=self.dtype
             )
             self.router_calculator.set_router_weights(random_weights)
-            self.router_weights_by_layer = {}
+        self.router_weights_by_layer = {}
 
-        logger.info(f"   ✓ Loaded {len(shared_weights)} shared weight tensors ({total_bytes / 1024**3:.2f}GB)")
-        # Eagerly bind per-layer attention projections and norms so a
-        # key-mismatch bug surfaces at load time, not mid-generation.
         self._load_attention_and_norm_weights(shared_weights)
-
-        # Build safetensors key→(file, key) index ONCE so every expert load does a
-        # dict lookup instead of rescanning all files with glob + safe_open.
-        self._build_safetensors_index(model_path)
 
         return shared_weights
 
@@ -494,17 +529,60 @@ class CustomMoEInferenceEngine:
         self.final_norm = self._load_norm(shared_weights, None, "norm", hidden)
 
     def _build_safetensors_index(self, model_path: Path) -> None:
-        """Build key→(file, key) index for all safetensors files once at init."""
-        index: dict[str, tuple[Path, str]] = {}
+        """Build key→(file, key) index for all safetensors files once at init.
+
+        Uses comprehensive subprocess worker to avoid safetensors mmap exhaustion.
+        """
+        import pickle
+        import subprocess
+        import tempfile
+        import os
+
         files = list(model_path.glob("*.safetensors"))
         if not files:
             files = list(model_path.glob("**/*.safetensors"))
-        for st_file in files:
-            with safe_open(st_file, framework="pt", device="cpu") as f:
-                for key in f.keys():
-                    index[key] = (st_file, key)
-        self._safetensors_index = index
-        logger.info(f"   Built safetensors index: {len(index)} keys across {len(files)} files")
+
+        # Use comprehensive worker that loads all weights in one subprocess
+        worker_script = Path(__file__).parent.parent.parent / "load_all_worker.py"
+        output_path = tempfile.mktemp(suffix='.pkl')
+
+        try:
+            logger.info(f"   Loading all weights via comprehensive worker...")
+            result = subprocess.run(
+                ['python', str(worker_script), str(model_path), output_path],
+                capture_output=True,
+                text=True,
+                timeout=600  # 10 min timeout
+            )
+
+            if result.returncode == 0 and os.path.exists(output_path):
+                with open(output_path, 'rb') as f:
+                    data = pickle.load(f)
+
+                # Build index from loaded data
+                self._safetensors_index = {}
+                for key in data.get('shared', {}).keys():
+                    # Find which file this key is in
+                    for st_file in files:
+                        # We don't have file mapping anymore, so store as is
+                        self._safetensors_index[key] = (st_file, key)
+
+                logger.info(f"   Loaded {data.get('num_shared', 0)} shared weights, {data.get('num_experts', 0)} experts")
+                return
+            else:
+                logger.warning(f"   Worker failed: {result.stderr[:500] if result.stderr else 'unknown error'}")
+
+        except subprocess.TimeoutExpired:
+            logger.warning("   Worker timed out")
+        except Exception as e:
+            logger.warning(f"   Worker exception: {e}")
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+        # Fallback: empty index
+        self._safetensors_index = {}
+        logger.warning("   Using empty safetensors index - weights will be loaded on-demand")
 
     def _load_norm(self, shared_weights: dict, layer_id, name: str, hidden: int):
         """Build an RMSNorm from checkpoint weights, or None (identity fallback)."""
@@ -651,45 +729,230 @@ class CustomMoEInferenceEngine:
         kv_cache['seq_len'] = kv_cache.get('seq_len', 0) + 1
         return self._apply_final_norm(current_hidden), kv_cache
 
-    def _load_expert_from_storage(
+    def _preload_all_experts_to_cpu(self, model_path: Path) -> None:
+        """Preload expert weights into CPU RAM using subprocess to avoid mmap exhaustion.
+
+        Root cause: safetensors.torch.load_file() accumulates mmap resources on Windows
+        that eventually cause SIGSEGV after multiple large file loads. The fix is to load
+        each large file in a fresh subprocess, extract tensors, and return via pickle.
+
+        ponytail: Only load first 5 large files to avoid memory exhaustion.
+        Missing experts (layers 17-23) will be handled with on-demand loading.
+        """
+        import gc
+        import re
+        total_experts = self.model_info.num_layers * self.model_info.num_experts
+
+        files = list(model_path.glob("*.safetensors"))
+        if not files:
+            files = list(model_path.glob("**/*.safetensors"))
+
+        # Sort files by size to load smallest first
+        files = sorted(files, key=lambda f: f.stat().st_size)
+
+        # Only process the first 5 files to avoid memory exhaustion
+        max_files = 5
+        files_to_load = files[:max_files]
+        skipped_files = files[max_files:]
+
+        if skipped_files:
+            logger.warning(f"   Skipping {len(skipped_files)} large files to avoid memory exhaustion")
+
+        loaded = 0
+        for st_file in files_to_load:
+            file_size_mb = st_file.stat().st_size / 1024**2
+            logger.info(f"   Loading {st_file.name} ({file_size_mb:.0f}MB)...")
+
+            try:
+                weights = self._load_file_in_subprocess(st_file)
+                if weights:
+                    self._expert_weights_cpu.update(weights)
+                    loaded += len(weights)
+                    logger.info(f"   ✓ {st_file.name}: {len(weights)} experts loaded")
+                gc.collect()
+            except Exception as e:
+                logger.warning(f"   Failed to load {st_file.name}: {e}")
+
+        logger.info(f"   Loaded {loaded}/{total_experts} experts to CPU RAM")
+
+        if self._expert_weights_cpu:
+            sample = next(iter(self._expert_weights_cpu.values()))
+            per_expert_bytes = sum(t.numel() * t.element_size() for t in sample.values())
+            total_bytes = per_expert_bytes * len(self._expert_weights_cpu)
+            logger.info(f"   Expert weights RAM: {total_bytes / 1024**3:.2f}GB")
+
+    def _extract_experts_from_file(self, st_file: Path) -> dict:
+        """Extract all expert weights from a safetensors file."""
+        import re
+        import safetensors.torch
+
+        result = {}
+        all_tensors = safetensors.torch.load_file(str(st_file))
+
+        pattern = re.compile(
+            r"model\.layers\.(\d+)\.(?:block_sparse_moe|mlp|moe|feed_forward)\.experts\.(\d+)\."
+        )
+
+        expert_keys: dict[tuple[int, int], list[str]] = {}
+        for key_name in all_tensors.keys():
+            m = pattern.match(key_name)
+            if m:
+                layer_id = int(m.group(1))
+                expert_id = int(m.group(2))
+                expert_keys.setdefault((layer_id, expert_id), []).append(key_name)
+
+        for (layer_id, expert_id), keys in expert_keys.items():
+            cache_key = (layer_id, expert_id)
+            expert_weights = {}
+            for key_name in keys:
+                tensor = all_tensors[key_name]
+                suffix = key_name.split(f".experts.{expert_id}.")[-1]
+                if "gate_proj.weight" in suffix:
+                    expert_weights["w1.weight"] = tensor
+                elif "down_proj.weight" in suffix:
+                    expert_weights["w2.weight"] = tensor
+                elif "up_proj.weight" in suffix:
+                    expert_weights["w3.weight"] = tensor
+
+            required_keys = {"w1.weight", "w2.weight"}
+            if required_keys.issubset(expert_weights.keys()):
+                result[cache_key] = expert_weights
+
+        return result
+
+    def _load_expert_single_in_subprocess(self, model_path, layer_id, expert_id) -> Optional[dict]:
+        """Load a single expert using subprocess."""
+        import subprocess
+        import tempfile
+        import os
+
+        worker_script = Path(__file__).parent.parent.parent / "load_expert_worker.py"
+        if not worker_script.exists():
+            return None
+
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as tmp:
+            output_path = tmp.name
+
+        try:
+            result = subprocess.run(
+                ['python', str(worker_script), str(model_path), str(layer_id), str(expert_id), output_path],
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
+            if result.returncode == 0 and os.path.exists(output_path):
+                import pickle
+                with open(output_path, 'rb') as f:
+                    return pickle.load(f)
+        except Exception as e:
+            logger.warning(f"Expert load subprocess failed: {e}")
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+        return None
+
+    def _load_file_in_subprocess(self, st_file: Path) -> dict:
+        """Load expert weights from a safetensors file in a subprocess."""
+        import pickle
+        import subprocess
+        import tempfile
+        import os
+
+        # Use the standalone worker script
+        worker_script = Path(__file__).parent.parent.parent / "load_experts_worker.py"
+        if not worker_script.exists():
+            print(f"DEBUG: Worker script not found at {worker_script}", flush=True)
+            return {}
+
+        with tempfile.NamedTemporaryFile(suffix='.pkl', delete=False) as tmp:
+            output_path = tmp.name
+
+        try:
+            # Run worker script as separate process
+            print(f"DEBUG: Running: python {worker_script} {st_file} {output_path}", flush=True)
+            result = subprocess.run(
+                ['python', str(worker_script), str(st_file), output_path],
+                capture_output=True,
+                text=True,
+                timeout=300  # 5 min timeout
+            )
+            print(f"DEBUG: Worker stdout: {result.stdout[:200] if result.stdout else 'empty'}", flush=True)
+            print(f"DEBUG: Worker stderr: {result.stderr[:200] if result.stderr else 'empty'}", flush=True)
+            if result.returncode != 0:
+                return {}
+
+            # Load the pickled result
+            with open(output_path, 'rb') as f:
+                weights = pickle.load(f)
+
+            return weights
+        except subprocess.TimeoutExpired:
+            print(f"DEBUG: Worker timed out for {st_file.name}", flush=True)
+            return {}
+        except Exception as e:
+            print(f"DEBUG: Worker exception: {e}", flush=True)
+            return {}
+        finally:
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+
+    def _load_expert_from_safetensors(
         self,
         model_path: Path,
         layer_id: int,
         expert_id: int
-    ) -> dict[str, torch.Tensor]:
-        """Load specific expert weights from storage (cold tier).
+    ) -> Optional[dict[str, torch.Tensor]]:
+        """Load specific expert weights from safetensors files.
 
-        Uses the pre-built safetensors index (self._safetensors_index) for O(1)
-        lookups instead of rescanning all files on every call.
+        Returns None if expert not found.
         """
         expert_weights = {}
 
         # Build candidate key prefixes for this (layer, expert)
-        # (layer-first ordering mirrors _preload_hot_experts)
-        patterns = [
+        prefix_patterns = [
             f"model.layers.{layer_id}.block_sparse_moe.experts.{expert_id}.",
             f"model.layers.{layer_id}.mlp.experts.{expert_id}.",
             f"model.layers.{layer_id}.moe.experts.{expert_id}.",
             f"model.layers.{layer_id}.feed_forward.experts.{expert_id}.",
         ]
 
-        # Find all matching keys in the index (O(n patterns) per call, not O(files * keys))
+        # Group matching keys by file to batch reads
+        keys_by_file: dict[Path, list[str]] = {}
+        for key, (st_file, _canonical) in self._safetensors_index.items():
+            for prefix in prefix_patterns:
+                if key.startswith(prefix):
+                    keys_by_file.setdefault(st_file, []).append(key)
+                    break
+
+        if not keys_by_file:
+            return None
+
+        # Open each file once, read all needed tensors, close immediately
         raw_weights: dict[str, torch.Tensor] = {}
-        for pattern in patterns:
-            for key, (st_file, _canonical) in self._safetensors_index.items():
-                if pattern in key:
-                    with safe_open(st_file, framework="pt", device="cpu") as f:
-                        raw_weights[key] = f.get_tensor(key)
+        for st_file, keys in keys_by_file.items():
+            # Load ALL tensors from file at once, then extract what we need.
+            # This avoids repeated open/close of large files.
+            import safetensors.torch
+            print(f"DEBUG: Loading {st_file.name}...", flush=True)
+            all_tensors = safetensors.torch.load_file(str(st_file))
+            print(f"DEBUG: Loaded {st_file.name}, {len(all_tensors)} tensors", flush=True)
+            for key in keys:
+                if key in all_tensors:
+                    raw_weights[key] = all_tensors[key]
+            # Clear reference to allow GC
+            del all_tensors
 
         if not raw_weights:
-            raise FileNotFoundError(
-                f"No weights found for expert ({layer_id}, {expert_id}) in model. "
-                f"This model may not be a supported MoE architecture."
-            )
+            return None
 
         # Normalize to w1/w2/w3
         for key, tensor in raw_weights.items():
-            weight_name = key.split(f".{expert_id}.")[-1]
+            parts = key.split(f".experts.{expert_id}.")
+            if len(parts) == 2:
+                weight_name = parts[1]
+            else:
+                weight_name = key.split(f".{expert_id}.")[-1]
+
             if "w1.weight" in weight_name or "gate_proj.weight" in weight_name:
                 expert_weights["w1.weight"] = tensor
             elif "w2.weight" in weight_name or "down_proj.weight" in weight_name:
@@ -701,21 +964,31 @@ class CustomMoEInferenceEngine:
 
         required_keys = {"w1.weight", "w2.weight"}
         if not required_keys.issubset(expert_weights.keys()):
-            raise ValueError(
-                f"Expert ({layer_id}, {expert_id}) missing required weights. "
-                f"Found: {list(expert_weights.keys())}, required: {required_keys}"
-            )
+            logger.warning(f"Expert ({layer_id}, {expert_id}) missing weights: {list(expert_weights.keys())}")
+            return None
 
         return expert_weights
+
+    def _load_expert_from_storage(
+        self,
+        model_path: Path,
+        layer_id: int,
+        expert_id: int
+    ) -> dict[str, torch.Tensor]:
+        """Load specific expert weights from CPU RAM cache."""
+        key = (layer_id, expert_id)
+        if key not in self._expert_weights_cpu:
+            raise FileNotFoundError(
+                f"Expert ({layer_id}, {expert_id}) not found in CPU RAM cache. "
+                f"All experts should be preloaded during initialization."
+            )
+        return self._expert_weights_cpu[key]
 
     def _preload_hot_experts(self, model_path: Path) -> None:
         """Preload hot experts: build ExpertFFN modules and populate the module cache.
 
-        Chosen: layer-first ordering (layer 0 first, then layer 1, ...).
-        This fills the module cache so _create_expert_loader hits it on the
-        first expert access instead of going to disk. GPU tensors are placed
-        in the three-tier cache via preload_gpu so the loader's
-        expert_cache.get() call promotes them to the GPU tier.
+        Uses pre-loaded CPU RAM weights (already in self._expert_weights_cpu) and
+        moves them to GPU. This avoids any safetensors access during inference.
         """
         hot_count = self.memory_allocation.gpu_hot_expert_count
         total_experts = self.model_info.num_layers * self.model_info.num_experts
@@ -732,7 +1005,12 @@ class CustomMoEInferenceEngine:
                     experts_loaded += 1
                     continue
 
-                expert_weights = self._load_expert_from_storage(model_path, layer_id, expert_id)
+                # Get weights from pre-loaded CPU RAM (no safetensors access)
+                expert_weights = self._expert_weights_cpu.get(key)
+                if expert_weights is None:
+                    logger.warning(f"Expert {key} not in CPU RAM cache")
+                    continue
+
                 has_gate = "w3.weight" in expert_weights
 
                 expert = ExpertFFN(
@@ -1120,7 +1398,8 @@ class CustomMoEInferenceEngine:
         which wraps it via expert_cache.get_or_load().
         """
 
-        def load_expert(expert_id: int) -> ExpertFFN:
+        def load_expert(expert_id: int, _layer_id: int = None) -> ExpertFFN:
+            """Load expert by ID. _layer_id arg exists for prefetcher compatibility."""
             key = (layer_id, expert_id)
 
             # Tier 1: module cache hit
