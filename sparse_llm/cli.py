@@ -52,10 +52,18 @@ def cli(verbose: bool):
 @click.option('--max-tokens',
               default=2048,
               help='Default maximum tokens to generate')
+@click.option('--max-seq-len',
+              default=1024,
+              type=int,
+              help='Maximum sequence length for KV cache (default: 1024, reduces memory)')
 @click.option('--dtype',
               default='float16',
-              type=click.Choice(['float16', 'bfloat16', 'float32']),
-              help='Model data type')
+              type=click.Choice(['float16', 'bfloat16', 'float32', 'int8', 'int4', 'fp8']),
+              help='Runtime computation and KV cache dtype')
+@click.option('--quantization', '-q',
+              default=None,
+              type=click.Choice(['int4', 'awq', 'gptq', 'fp8', 'int8', 'float16', 'bfloat16', 'float32']),
+              help='Weight quantization format — weight-only storage, does not affect KV cache')
 def serve(
     model: str,
     host: str,
@@ -67,7 +75,9 @@ def serve(
     allow_cpu_offload: bool,
     allow_ssd_offload: bool,
     max_tokens: int,
-    dtype: str
+    max_seq_len: int,
+    dtype: str,
+    quantization: str | None
 ):
     """
     Start MoE inference server with three-tier expert caching.
@@ -114,9 +124,15 @@ def serve(
         host=host,
         port=port,
         device=device,
-        expert_cache_size=cache_size,  # Keep for backward compatibility
+        expert_cache_size=cache_size,
         max_tokens=max_tokens,
-        dtype=dtype
+        max_seq_len=max_seq_len,
+        dtype=dtype,
+        quantization=quantization,
+        gpu_cache_gb=gpu_cache_gb if gpu_cache_gb is not None else 0.0,
+        cpu_cache_gb=cpu_cache_gb if cpu_cache_gb is not None else 0.0,
+        allow_cpu_offload=allow_cpu_offload,
+        allow_ssd_offload=allow_ssd_offload,
     )
 
 
@@ -137,12 +153,31 @@ def serve(
               default='cuda',
               type=click.Choice(['cuda', 'cpu', 'auto']),
               help='Device to use')
+@click.option('--dtype',
+              default='float16',
+              type=click.Choice(['float16', 'bfloat16', 'float32', 'int8', 'int4', 'fp8']),
+              help='Runtime computation dtype')
+@click.option('--quantization', '-q',
+              default=None,
+              type=click.Choice(['int4', 'awq', 'gptq', 'fp8', 'int8', 'float16', 'bfloat16', 'float32']),
+              help='Weight quantization format')
+@click.option('--streaming-mode',
+              is_flag=True,
+              help='Enable streaming mode for low-resource devices (no caching, load-execute-free)')
+@click.option('--max-parallel-expert-loads',
+              default=4,
+              type=int,
+              help='Number of parallel expert loads in streaming mode (default: 4)')
 def generate(
     model: str,
     prompt: str,
     max_tokens: int,
     temperature: float,
-    device: str
+    device: str,
+    dtype: str,
+    quantization: str | None,
+    streaming_mode: bool,
+    max_parallel_expert_loads: int,
 ):
     """
     Generate text from a prompt (CLI mode).
@@ -161,15 +196,23 @@ def generate(
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     click.echo(f"Loading model: {model}")
-    click.echo(f"Device: {device}\n")
+    click.echo(f"Device: {device}")
+    click.echo(f"Dtype: {dtype}" + (f" + {quantization}" if quantization else "") + "\n")
 
     # Create config
     config = InferenceConfig(
         model_path=model,
         device=device,
         max_tokens=max_tokens,
-        temperature=temperature
+        temperature=temperature,
+        dtype=dtype,
+        quantization=quantization,
+        streaming_mode=streaming_mode,
+        max_parallel_expert_loads=max_parallel_expert_loads,
     )
+
+    if streaming_mode:
+        click.echo("Streaming mode enabled: load-execute-free pattern (no caching)")
 
     # Initialize engine
     click.echo("Initializing engine...")
