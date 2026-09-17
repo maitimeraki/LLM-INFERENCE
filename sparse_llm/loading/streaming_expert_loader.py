@@ -218,69 +218,91 @@ class StreamingExpertLoader:
         layer_id: int,
         expert_ids: List[int],
         hidden_state: torch.Tensor,
+        expert_indices: torch.Tensor,
         expert_weights: torch.Tensor,
     ) -> torch.Tensor:
         """Load multiple experts in parallel, execute, and free.
 
         Args:
             layer_id: Layer index
-            expert_ids: List of expert IDs to execute
-            hidden_state: Input tensor [batch, hidden]
-            expert_weights: Router weights for combining outputs
+            expert_ids: List of expert IDs to execute (from analyze_expert_frequency)
+            hidden_state: Input tensor [batch, seq_len, hidden] or [batch, hidden]
+            expert_indices: Expert assignments [batch, seq_len, top_k]
+            expert_weights: Router weights [batch, seq_len, top_k]
 
         Returns:
             Combined expert output tensor
         """
-        hidden_dim = hidden_state.shape[-1]
+        # Handle 2D input (batch, hidden) vs 3D (batch, seq, hidden)
+        original_shape = hidden_state.shape
+        if hidden_state.dim() == 2:
+            hidden_state = hidden_state.unsqueeze(1)  # [batch, 1, hidden]
+            expert_indices = expert_indices.unsqueeze(1)  # [batch, 1, top_k]
+            expert_weights = expert_weights.unsqueeze(1)  # [batch, 1, top_k]
 
-        # Initialize output accumulator
+        batch_size, seq_len, hidden_dim = hidden_state.shape
+        _, _, top_k = expert_weights.shape
+
+        # Output: [batch, seq, hidden]
         output = torch.zeros_like(hidden_state)
 
         # Load experts in parallel
         loaded_experts = self.load_experts_parallel(layer_id, list(expert_ids))
 
-        # Execute each expert
-        for expert_id in expert_ids:
-            if expert_id not in loaded_experts:
-                continue
+        # Flatten tensors for processing: [batch*seq, ...]
+        hidden_flat = hidden_state.view(-1, hidden_dim)  # [N, hidden]
+        indices_flat = expert_indices.view(-1, top_k)  # [N, top_k]
+        weights_flat = expert_weights.view(-1, top_k)  # [N, top_k]
+        output_flat = output.view(-1, hidden_dim)  # [N, hidden]
 
-            device_weights = self.safe_load_to_device(loaded_experts[expert_id])
+        num_tokens = hidden_flat.shape[0]
 
-            try:
-                w1 = device_weights["w1.weight"]
-                w2 = device_weights["w2.weight"]
-                expert_dim, _ = w1.shape
-                has_gate = "w3.weight" in device_weights
+        # Process each token
+        for token_idx in range(num_tokens):
+            token_hidden = hidden_flat[token_idx:token_idx + 1]  # [1, hidden]
+            token_experts = indices_flat[token_idx]  # [top_k]
+            token_weights = weights_flat[token_idx]  # [top_k]
 
-                expert = ExpertFFN(
-                    hidden_dim=hidden_dim,
-                    expert_dim=expert_dim,
-                    activation="silu",
-                    has_gate=has_gate,
-                    dtype=w1.dtype,
-                ).to(self.device)
+            for expert_id, weight in zip(token_experts.tolist(), token_weights.tolist()):
+                if expert_id not in loaded_experts:
+                    continue
 
-                expert.w1.weight.copy_(w1)
-                expert.w2.weight.copy_(w2)
-                if has_gate and expert.w3 is not None:
-                    expert.w3.weight.copy_(device_weights["w3.weight"])
-                expert.eval()
+                device_weights = self.safe_load_to_device(loaded_experts[expert_id])
 
-                with torch.no_grad():
-                    expert_output = expert(hidden_state)
+                try:
+                    w1 = device_weights["w1.weight"]
+                    w2 = device_weights["w2.weight"]
+                    expert_dim, _ = w1.shape
+                    has_gate = "w3.weight" in device_weights
 
-                # Get router weight for this expert
-                if expert_weights.dim() == 1:
-                    router_w = expert_weights[expert_ids.index(expert_id)]
-                else:
-                    router_w = expert_weights[expert_ids.index(expert_id)]
+                    expert = ExpertFFN(
+                        hidden_dim=hidden_dim,
+                        expert_dim=expert_dim,
+                        activation="silu",
+                        has_gate=has_gate,
+                        dtype=w1.dtype,
+                    ).to(self.device)
 
-                output = output + router_w * expert_output
+                    expert.w1.weight.copy_(w1)
+                    expert.w2.weight.copy_(w2)
+                    if has_gate and expert.w3 is not None:
+                        expert.w3.weight.copy_(device_weights["w3.weight"])
+                    expert.eval()
 
-            finally:
-                del expert
-                del device_weights
-                if self.device.type == "cuda":
-                    torch.cuda.empty_cache()
+                    with torch.no_grad():
+                        expert_output = expert(token_hidden)  # [1, hidden]
+
+                    output_flat[token_idx] += weight * expert_output.squeeze(0)
+
+                finally:
+                    del expert
+                    del device_weights
+                    if self.device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+        # Reshape back
+        output = output_flat.view(batch_size, seq_len, hidden_dim)
+        if len(original_shape) == 2:
+            output = output.squeeze(1)  # [batch, hidden]
 
         return output

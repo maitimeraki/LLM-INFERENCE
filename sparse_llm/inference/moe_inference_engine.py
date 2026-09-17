@@ -856,6 +856,7 @@ class CustomMoEInferenceEngine:
                 layer_id=layer_idx,
                 expert_ids=activated_experts,
                 hidden_state=normed,
+                expert_indices=expert_indices,
                 expert_weights=expert_weights,
             )
         else:

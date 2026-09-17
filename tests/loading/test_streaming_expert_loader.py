@@ -127,6 +127,46 @@ def test_execute_and_free():
     assert isinstance(output, torch.Tensor)
 
 
+def test_execute_experts_parallel():
+    """Test parallel execution of multiple experts with proper routing."""
+    def dummy_loader(layer_id, expert_id):
+        return {
+            "w1.weight": torch.randn(EXPERT_DIM, HIDDEN_DIM),
+            "w2.weight": torch.randn(HIDDEN_DIM, EXPERT_DIM),
+        }
+
+    loader = StreamingExpertLoader(
+        storage_loader=dummy_loader,
+        device="cpu",
+        max_parallel=4
+    )
+
+    # Create test input [batch, seq_len, hidden_dim]
+    hidden = torch.randn(2, 4, HIDDEN_DIM)
+
+    # Create routing: 2 tokens, each routes to 2 experts
+    # Token 0 -> experts 0, 1
+    # Token 1 -> experts 1, 2
+    expert_indices = torch.tensor([
+        [[0, 1], [1, 2], [0, 2], [1, 0]],  # batch 0
+        [[1, 0], [2, 1], [0, 1], [2, 0]],  # batch 1
+    ])
+    expert_weights = torch.ones_like(expert_indices, dtype=torch.float32) * 0.5
+
+    expert_ids = [0, 1, 2]
+
+    output = loader.execute_experts_parallel(
+        layer_id=0,
+        expert_ids=expert_ids,
+        hidden_state=hidden,
+        expert_indices=expert_indices,
+        expert_weights=expert_weights,
+    )
+
+    assert output.shape == hidden.shape
+    assert isinstance(output, torch.Tensor)
+
+
 def test_safe_load_to_device():
     """Test safe loading to device with memory guard."""
     def dummy_loader(layer_id, expert_id):
