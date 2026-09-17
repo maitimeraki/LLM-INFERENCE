@@ -11,6 +11,7 @@ from sparse_llm.models.adapters import (
     TransformersCausalLMAdapter,
 )
 from sparse_llm.models.mixtral_adapter import MixtralAdapter, is_mixtral_config
+from sparse_llm.models.custom_moe_adapter import CustomMoEAdapter
 
 
 AdapterFactory = Callable[..., ModelAdapter]
@@ -80,7 +81,33 @@ class ModelRegistry:
         return tuple(item.name for item in self._registrations)
 
 
+def _is_custom_moe_config(config) -> bool:
+    """Predicate to detect if config requests CustomMoEAdapter.
+
+    CustomMoEAdapter is opt-in via explicit flag or can be enabled for any MoE model.
+    For now, this returns False by default - users must explicitly request it.
+    """
+    # Check for explicit custom_moe flag in config
+    if hasattr(config, "custom_moe") and config.custom_moe:
+        return True
+
+    # Future: Could auto-detect certain MoE architectures here
+    # For now, require explicit opt-in
+    return False
+
+
 _DEFAULT_REGISTRY = ModelRegistry()
+
+# CustomMoE adapter - highest priority for explicit custom MoE requests
+_DEFAULT_REGISTRY.register(
+    "custom_moe",
+    lambda model_id, *, policy=None, config=None, **kwargs: CustomMoEAdapter(
+        model_id, policy=policy, config=config, **kwargs
+    ),
+    _is_custom_moe_config,
+    priority=20,
+)
+
 # Mixtral adapter kept for backward compatibility with existing paging hooks
 _DEFAULT_REGISTRY.register(
     "mixtral",

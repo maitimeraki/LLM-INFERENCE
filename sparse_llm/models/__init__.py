@@ -5,13 +5,6 @@ from sparse_llm.models.adapters import (
     ModelCapabilities,
     TransformersCausalLMAdapter,
 )
-from sparse_llm.models.paging import (
-    LoadedExpertProtocol,
-    PagedMoELayer,
-    PagingCapabilities,
-    PagingValidationResult,
-    RouterSelection,
-)
 from sparse_llm.models.registry import (
     ModelRegistry,
     create_model_adapter,
@@ -22,14 +15,9 @@ from sparse_llm.models.universal_adapter import UniversalMoEAdapter
 __all__ = [
     "DevicePolicy",
     "ExpertKey",
-    "LoadedExpertProtocol",
     "ModelAdapter",
     "ModelCapabilities",
     "ModelRegistry",
-    "PagedMoELayer",
-    "PagingCapabilities",
-    "PagingValidationResult",
-    "RouterSelection",
     "TransformersCausalLMAdapter",
     "UniversalMoEAdapter",
     "create_model_adapter",

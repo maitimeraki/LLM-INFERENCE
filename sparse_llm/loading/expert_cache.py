@@ -34,8 +34,8 @@ class ExpertCache:
         self._gpu_cache: OrderedDict[tuple[int, int], dict[str, torch.Tensor]] = OrderedDict()
         self._cpu_cache: OrderedDict[tuple[int, int], dict[str, torch.Tensor]] = OrderedDict()
 
-        # Statistics
-        self.stats = {
+        # Statistics (use _stats to avoid conflict with stats() method)
+        self._stats = {
             "total_accesses": 0,
             "gpu_hits": 0,
             "cpu_hits": 0,
@@ -95,28 +95,28 @@ class ExpertCache:
             (weights, tier) where tier is "gpu", "cpu", or "storage"
         """
         key = (layer_id, expert_id)
-        self.stats["total_accesses"] += 1
+        self._stats["total_accesses"] += 1
 
         # Check GPU cache
         if key in self._gpu_cache:
-            self.stats["gpu_hits"] += 1
+            self._stats["gpu_hits"] += 1
             self._gpu_cache.move_to_end(key)  # Mark as recently used
             return self._gpu_cache[key], "gpu"
 
         # Check CPU cache
         if key in self._cpu_cache:
-            self.stats["cpu_hits"] += 1
+            self._stats["cpu_hits"] += 1
             weights = self._cpu_cache[key]
             self._cpu_cache.move_to_end(key)  # Mark as recently used
 
             # Promote to GPU
             self._promote_to_gpu(key, weights)
-            self.stats["promotions"] += 1
+            self._stats["promotions"] += 1
 
             return self._gpu_cache[key], "cpu"
 
         # Load from storage
-        self.stats["storage_hits"] += 1
+        self._stats["storage_hits"] += 1
 
         if self.storage_loader is None:
             raise ValueError(f"Expert ({layer_id}, {expert_id}) not in cache and no storage loader configured")
@@ -132,6 +132,59 @@ class ExpertCache:
 
         return self._gpu_cache[key], "storage"
 
+    def get_or_load(
+        self,
+        key_or_expert: tuple[int, int] | int,
+        loader: Any,
+        layer_id: int | None = None,
+        size_bytes: int | None = None,
+        pin: bool = False
+    ) -> Any:
+        """Get expert from cache or load if missing (API compatibility with old cache).
+
+        This method simply calls the loader, which handles the three-tier cache lookup internally.
+
+        Args:
+            key_or_expert: Either (layer_id, expert_id) tuple or expert_id int
+            loader: Callable that loads and returns an ExpertFFN module
+            layer_id: Layer ID (used if key_or_expert is int)
+            size_bytes: Size in bytes (ignored - computed from tensors)
+            pin: Whether to pin expert (ignored - handled by LRU)
+
+        Returns:
+            ExpertFFN module ready for forward pass
+        """
+        # The loader function is responsible for:
+        # 1. Checking the three-tier cache (GPU → CPU → Storage)
+        # 2. Loading from storage if needed
+        # 3. Creating the ExpertFFN module
+        # 4. Loading the weights into the module
+        return loader()
+
+    def unpin(self, expert_id: int, layer_id: int | None = None) -> None:
+        """Unpin an expert (no-op for compatibility with old cache).
+
+        The old cache had pin/unpin to prevent eviction during execution.
+        The three-tier cache uses LRU, so this is a no-op.
+        """
+        pass
+
+    def contains(self, expert_id: int, layer_id: int | None = None) -> bool:
+        """Check if expert is in cache (any tier).
+
+        Args:
+            expert_id: Expert identifier
+            layer_id: Layer identifier
+
+        Returns:
+            True if expert is in GPU or CPU cache
+        """
+        if layer_id is None:
+            layer_id = 0
+
+        key = (layer_id, expert_id)
+        return key in self._gpu_cache or key in self._cpu_cache
+
     def _evict_from_gpu(self) -> None:
         """Evict least recently used expert from GPU to CPU."""
         if not self._gpu_cache:
@@ -139,7 +192,7 @@ class ExpertCache:
 
         # Pop oldest (LRU)
         key, weights = self._gpu_cache.popitem(last=False)
-        self.stats["evictions"] += 1
+        self._stats["evictions"] += 1
 
         # Move to CPU cache
         self.preload_cpu(key[0], key[1], weights)
@@ -151,7 +204,7 @@ class ExpertCache:
 
         # Pop oldest (LRU) and discard
         self._cpu_cache.popitem(last=False)
-        self.stats["evictions"] += 1
+        self._stats["evictions"] += 1
 
     def _promote_to_gpu(self, key: tuple[int, int], weights: dict[str, torch.Tensor]) -> None:
         """Promote expert from CPU to GPU."""
@@ -165,13 +218,17 @@ class ExpertCache:
 
     def get_stats(self) -> dict[str, Any]:
         """Get cache statistics."""
-        total = self.stats["total_accesses"]
+        total = self._stats["total_accesses"]
         if total == 0:
-            return {**self.stats, "gpu_hit_rate": 0.0, "cpu_hit_rate": 0.0, "storage_miss_rate": 0.0}
+            return {**self._stats, "gpu_hit_rate": 0.0, "cpu_hit_rate": 0.0, "storage_miss_rate": 0.0}
 
         return {
-            **self.stats,
-            "gpu_hit_rate": self.stats["gpu_hits"] / total,
-            "cpu_hit_rate": self.stats["cpu_hits"] / total,
-            "storage_miss_rate": self.stats["storage_hits"] / total
+            **self._stats,
+            "gpu_hit_rate": self._stats["gpu_hits"] / total,
+            "cpu_hit_rate": self._stats["cpu_hits"] / total,
+            "storage_miss_rate": self._stats["storage_hits"] / total
         }
+
+    def stats(self) -> dict[str, Any]:
+        """Alias for get_stats() for compatibility with ExpertCacheManager."""
+        return self.get_stats()
